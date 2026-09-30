@@ -526,6 +526,9 @@ async fn compile(
     if let Ok(mut jobs) = state.jobs.lock() {
         jobs.remove(&id);
     }
+    if let Err(error) = &result {
+        eprintln!("tuntex-server: request {id}: {}: {}", error.1, error.2);
+    }
     result
 }
 
@@ -812,7 +815,9 @@ fn prepare_output_directories(
         let path = if value.starts_with("/workspace") {
             virtual_path(workspace, value)?
         } else {
-            cwd.join(clean_relative(value)?)
+            cwd.join(clean_relative(value).map_err(|_| {
+                ApiError::invalid(format!("invalid relative output directory {value:?}"))
+            })?)
         };
         fs::create_dir_all(path).map_err(|e| ApiError::internal(e.to_string()))?;
     }
@@ -956,7 +961,8 @@ fn extract_request(
         let raw = entry.path_bytes();
         let name = std::str::from_utf8(&raw)
             .map_err(|_| ApiError::invalid("archive path is not UTF-8"))?;
-        let relative = clean_relative(name)?;
+        let relative = clean_relative(name)
+            .map_err(|_| ApiError::invalid(format!("invalid request archive member {name:?}")))?;
         let head = relative.components().next().and_then(|v| match v {
             Component::Normal(n) => n.to_str(),
             _ => None,
@@ -998,7 +1004,11 @@ fn virtual_path(workspace: &Path, value: &str) -> Result<PathBuf, ApiError> {
     if relative.is_empty() {
         Ok(workspace.to_path_buf())
     } else {
-        Ok(workspace.join(clean_relative(relative)?))
+        Ok(workspace.join(
+            clean_relative(relative).map_err(|_| {
+                ApiError::invalid(format!("invalid virtual workspace path {value:?}"))
+            })?,
+        ))
     }
 }
 
@@ -1075,9 +1085,11 @@ fn build_result(
     for name in changed {
         total = total
             .checked_add(
-                fs::metadata(workspace.join(clean_relative(name)?))
-                    .map_err(|e| ApiError::internal(e.to_string()))?
-                    .len(),
+                fs::metadata(workspace.join(clean_relative(name).map_err(|_| {
+                    ApiError::invalid(format!("invalid changed-file path {name:?}"))
+                })?))
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .len(),
             )
             .ok_or_else(|| ApiError::too_large("result size overflow"))?;
     }
@@ -1093,7 +1105,9 @@ fn build_result(
     for name in changed {
         builder
             .append_path_with_name(
-                workspace.join(clean_relative(name)?),
+                workspace.join(clean_relative(name).map_err(|_| {
+                    ApiError::invalid(format!("invalid result-file path {name:?}"))
+                })?),
                 format!("files/{name}"),
             )
             .map_err(|e| ApiError::internal(e.to_string()))?;
