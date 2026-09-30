@@ -1,0 +1,12 @@
+socket: 127.0.0.1:38117
+tex: xelatex
+workspace: null
+cwd: null
+token: ""
+timeout_seconds: 120
+forward_env: []
+max_upload_size: 536870912
+max_file_count: 50000
+debug: false
+keep_temp: false
+

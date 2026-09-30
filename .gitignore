@@ -1,0 +1,24 @@
+/target/
+/client/.runtime-tests/
+/server/.runtime/
+/.runtime-tests/
+
+# Local configuration and secrets
+/tun-tex-cfg.yaml
+/client/tun-tex-cfg.yaml
+/server/tuntex-server.yaml
+/.env
+/.env.*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# IDE and OS files
+/.vscode/
+/.idea/
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini
