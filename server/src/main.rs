@@ -658,12 +658,12 @@ fn run_job(
         .engines
         .get(&meta.engine)
         .ok_or_else(|| ApiError::invalid("engine is not configured"))?;
+    prepare_output_directories(&workspace, &cwd, &meta.argv)?;
     let mapped_argv = meta
         .argv
         .iter()
         .map(|argument| map_argument(&workspace, argument))
         .collect::<Result<Vec<_>, _>>()?;
-    prepare_output_directories(&workspace, &cwd, &mapped_argv)?;
     let mut command = Command::new(&engine.command);
     command
         .args(&engine.args)
