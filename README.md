@@ -144,7 +144,7 @@ Run the server in the background and manage it with:
 
 ```bash
 tuntex-server start
-tuntex-server ls
+tuntex-server status
 tuntex-server stop
 ```
 

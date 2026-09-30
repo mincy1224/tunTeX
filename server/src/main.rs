@@ -216,10 +216,10 @@ async fn main() {
     let result = match env::args().nth(1).as_deref() {
         None | Some("run") | Some("__run") => serve().await,
         Some("start") => start_server(),
-        Some("ls") => list_server(),
+        Some("status") => server_status(),
         Some("stop") => stop_server(),
         Some(command) => Err(format!(
-            "unknown command {command:?}; expected start, ls, stop, or run"
+            "unknown command {command:?}; expected start, status, stop, or run"
         )),
     };
     if let Err(error) = result {
@@ -333,7 +333,7 @@ fn start_server() -> Result<(), String> {
     Ok(())
 }
 
-fn list_server() -> Result<(), String> {
+fn server_status() -> Result<(), String> {
     match read_pid()? {
         Some(pid) if process_alive(pid) => {
             println!("tuntex-server: running (pid {pid})");

@@ -107,7 +107,7 @@ Copy-Item server/tuntex-server.example.yaml tuntex-server.yaml
 
 ```bash
 tuntex-server start
-tuntex-server ls
+tuntex-server status
 tuntex-server stop
 ```
 
