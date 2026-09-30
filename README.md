@@ -140,6 +140,16 @@ $env:TUNTEX_CONFIG = "C:\tuntex\tuntex-server.yaml"
 TUNTEX_CONFIG=/etc/tuntex/server.yaml ./tuntex-server
 ```
 
+Run the server in the background and manage it with:
+
+```bash
+tuntex-server start
+tuntex-server ls
+tuntex-server stop
+```
+
+`run` keeps the server in the foreground. Background state and logs are stored under `~/.local/state/tuntex` on Linux and `%LOCALAPPDATA%\tuntex` on Windows.
+
 The server executes only engines that are both declared in the YAML file and present in its built-in allowlist. A client cannot select an arbitrary executable.
 
 ## Editor integration

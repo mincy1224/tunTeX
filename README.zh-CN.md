@@ -103,6 +103,16 @@ Copy-Item server/tuntex-server.example.yaml tuntex-server.yaml
 
 根据服务端安装的 TeX 发行版配置 `engines`。服务端默认从当前目录读取 `tuntex-server.yaml`。也可以使用 `TUNTEX_CONFIG` 指定另一个服务端配置文件路径。
 
+后台启动并管理服务端：
+
+```bash
+tuntex-server start
+tuntex-server ls
+tuntex-server stop
+```
+
+`run` 用于前台运行。Linux 的后台状态和日志保存在 `~/.local/state/tuntex`，Windows 则保存在 `%LOCALAPPDATA%\tuntex`。
+
 服务端只会执行同时满足以下条件的引擎：已在 YAML 中声明，并且属于内置允许列表。客户端不能选择任意可执行文件。
 
 ## 编辑器集成

@@ -213,9 +213,208 @@ struct FileStamp {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = serve().await {
+    let result = match env::args().nth(1).as_deref() {
+        None | Some("run") | Some("__run") => serve().await,
+        Some("start") => start_server(),
+        Some("ls") => list_server(),
+        Some("stop") => stop_server(),
+        Some(command) => Err(format!(
+            "unknown command {command:?}; expected start, ls, stop, or run"
+        )),
+    };
+    if let Err(error) = result {
         eprintln!("tuntex-server: {error}");
-        std::process::exit(78);
+        std::process::exit(1);
+    }
+}
+
+fn state_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let base = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
+    let path = base
+        .ok_or_else(|| "cannot determine the per-user state directory".to_string())?
+        .join("tuntex");
+    fs::create_dir_all(&path)
+        .map_err(|e| format!("cannot create state directory {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn pid_path() -> Result<PathBuf, String> {
+    Ok(state_dir()?.join("server.pid"))
+}
+
+fn read_pid() -> Result<Option<u32>, String> {
+    let path = pid_path()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    raw.trim()
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("invalid PID in {}", path.display()))
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+fn remove_stale_pid() -> Result<(), String> {
+    let path = pid_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
+    }
+}
+
+fn start_server() -> Result<(), String> {
+    if let Some(pid) = read_pid()? {
+        if process_alive(pid) {
+            return Err(format!("already running (pid {pid})"));
+        }
+        remove_stale_pid()?;
+    }
+
+    let directory = state_dir()?;
+    let log_path = directory.join("server.log");
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
+    let stderr = log
+        .try_clone()
+        .map_err(|e| format!("cannot duplicate log handle: {e}"))?;
+    let executable = env::current_exe().map_err(|e| format!("cannot locate executable: {e}"))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("__run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    detach(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("cannot start background process: {e}"))?;
+    std::thread::sleep(Duration::from_millis(200));
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|e| format!("cannot inspect background process: {e}"))?
+    {
+        return Err(format!(
+            "background process exited with {status}; see {}",
+            log_path.display()
+        ));
+    }
+    let pid = child.id();
+    fs::write(pid_path()?, format!("{pid}\n"))
+        .map_err(|e| format!("cannot write PID file: {e}"))?;
+    println!(
+        "tuntex-server: started (pid {pid}, log {})",
+        log_path.display()
+    );
+    Ok(())
+}
+
+fn list_server() -> Result<(), String> {
+    match read_pid()? {
+        Some(pid) if process_alive(pid) => {
+            println!("tuntex-server: running (pid {pid})");
+            Ok(())
+        }
+        Some(_) => {
+            remove_stale_pid()?;
+            println!("tuntex-server: stopped");
+            Ok(())
+        }
+        None => {
+            println!("tuntex-server: stopped");
+            Ok(())
+        }
+    }
+}
+
+fn stop_server() -> Result<(), String> {
+    let Some(pid) = read_pid()? else {
+        return Err("not running".into());
+    };
+    if !process_alive(pid) {
+        remove_stale_pid()?;
+        return Err("not running (removed stale PID file)".into());
+    }
+    terminate(pid)?;
+    for _ in 0..50 {
+        if !process_alive(pid) {
+            remove_stale_pid()?;
+            println!("tuntex-server: stopped (pid {pid})");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("process {pid} did not stop within 5 seconds"))
+}
+
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+}
+
+#[cfg(unix)]
+fn terminate(pid: u32) -> Result<(), String> {
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot stop process {pid}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn terminate(pid: u32) -> Result<(), String> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T"])
+        .status()
+        .map_err(|e| format!("cannot run taskkill: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("taskkill failed for process {pid}"))
     }
 }
 
@@ -247,6 +446,17 @@ async fn serve() -> Result<(), String> {
 }
 
 async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
     let _ = tokio::signal::ctrl_c().await;
 }
 
