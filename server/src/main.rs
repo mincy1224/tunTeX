@@ -450,6 +450,7 @@ fn run_job(
         .iter()
         .map(|argument| map_argument(&workspace, argument))
         .collect::<Result<Vec<_>, _>>()?;
+    prepare_output_directories(&workspace, &cwd, &mapped_argv)?;
     let mut command = Command::new(&engine.command);
     command
         .args(&engine.args)
@@ -555,6 +556,53 @@ fn run_job(
         &changed,
     )?;
     Ok(result_path)
+}
+
+fn prepare_output_directories(
+    workspace: &Path,
+    cwd: &Path,
+    argv: &[String],
+) -> Result<(), ApiError> {
+    let mut next_is_directory = false;
+    for argument in argv {
+        let value = if next_is_directory {
+            next_is_directory = false;
+            Some(argument.as_str())
+        } else if let Some(value) = argument
+            .strip_prefix("-output-directory=")
+            .or_else(|| argument.strip_prefix("--output-directory="))
+            .or_else(|| argument.strip_prefix("-outdir="))
+            .or_else(|| argument.strip_prefix("--outdir="))
+            .or_else(|| argument.strip_prefix("-aux-directory="))
+            .or_else(|| argument.strip_prefix("--aux-directory="))
+        {
+            Some(value)
+        } else if matches!(
+            argument.as_str(),
+            "-output-directory"
+                | "--output-directory"
+                | "-outdir"
+                | "--outdir"
+                | "-aux-directory"
+                | "--aux-directory"
+        ) {
+            next_is_directory = true;
+            None
+        } else {
+            None
+        };
+        let Some(value) = value else { continue };
+        if value.is_empty() || value.starts_with('-') {
+            return Err(ApiError::invalid("output directory is empty or invalid"));
+        }
+        let path = if value.starts_with("/workspace") {
+            virtual_path(workspace, value)?
+        } else {
+            cwd.join(clean_relative(value)?)
+        };
+        fs::create_dir_all(path).map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn validate_meta(config: &Config, id: Uuid, meta: &RequestMeta) -> Result<(), ApiError> {
