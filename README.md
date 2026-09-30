@@ -4,8 +4,6 @@
 
 tunTeX is a remote LaTeX compilation proxy written in Rust. An editor or build tool invokes the local client, the client uploads the workspace, and the server runs the real TeX engine. Generated files, stdout, stderr, and the exit code are then synchronized back to the local machine.
 
-Both the client and server are standalone native executables with no Python dependency.
-
 ## How it works
 
 ```text
