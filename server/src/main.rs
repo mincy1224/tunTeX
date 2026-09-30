@@ -783,6 +783,8 @@ fn prepare_output_directories(
             .or_else(|| argument.strip_prefix("--output-directory="))
             .or_else(|| argument.strip_prefix("-outdir="))
             .or_else(|| argument.strip_prefix("--outdir="))
+            .or_else(|| argument.strip_prefix("-auxdir="))
+            .or_else(|| argument.strip_prefix("--auxdir="))
             .or_else(|| argument.strip_prefix("-aux-directory="))
             .or_else(|| argument.strip_prefix("--aux-directory="))
         {
@@ -793,6 +795,8 @@ fn prepare_output_directories(
                 | "--output-directory"
                 | "-outdir"
                 | "--outdir"
+                | "-auxdir"
+                | "--auxdir"
                 | "-aux-directory"
                 | "--aux-directory"
         ) {
@@ -1182,6 +1186,21 @@ mod tests {
         );
         assert!(map_argument(root, "/etc/passwd").is_err());
         assert!(map_argument(root, "-outdir=C:/temp").is_err());
+    }
+
+    #[test]
+    fn latexmk_output_directories_are_prepared() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let arguments = vec![
+            "-xelatex".into(),
+            "-outdir=/workspace".into(),
+            "-auxdir=/workspace/build".into(),
+            "/workspace/main.tex".into(),
+        ];
+        prepare_output_directories(&workspace, &workspace, &arguments).unwrap();
+        assert!(workspace.join("build").is_dir());
     }
 
     #[test]
