@@ -165,6 +165,7 @@ where
     );
 
     let request_path = scratch.join("request.tar.gz");
+    let preparation_started = std::time::Instant::now();
     let remote = Remote::new(&config.url, config.token.clone(), config.timeout_seconds)?;
     let mut all_sources = std::collections::BTreeSet::new();
     let report = if metadata_only {
@@ -229,6 +230,11 @@ where
             indexed.insert(relative, path);
         }
         all_sources = indexed.values().cloned().collect();
+        log.line(&format!(
+            "discovery and hashing: {}ms",
+            preparation_started.elapsed().as_millis()
+        ));
+        let negotiation_started = std::time::Instant::now();
         let selected = if config.token.is_some() {
             remote
                 .missing_files(&metadata.source_manifest)?
@@ -243,6 +249,10 @@ where
         } else {
             indexed.into_values().collect()
         };
+        log.line(&format!(
+            "manifest negotiation: {}ms",
+            negotiation_started.elapsed().as_millis()
+        ));
         archive::create_selected_archive(
             &request_path,
             &config.workspace,
@@ -262,6 +272,7 @@ where
     ));
 
     let result_path = scratch.join("result.tar.gz");
+    let transfer_started = std::time::Instant::now();
     let received = match remote.compile(&request_path, &result_path, &request_id) {
         Err(error) if !metadata_only && error.message().contains("retry synchronization") => {
             log.line("source cache changed; retrying with the complete dependency set");
@@ -280,12 +291,17 @@ where
         outcome => outcome?,
     };
     log.line(&format!("result size: {}", archive::human_size(received)));
+    log.line(&format!(
+        "compile request and transfer: {}ms",
+        transfer_started.elapsed().as_millis()
+    ));
 
     let staging = scratch.join("staging");
     let query_output = scratch.join("query-output");
     if metadata_only {
         fs::create_dir(&query_output).map_err(|e| Error::software(e.to_string()))?;
     }
+    let application_started = std::time::Instant::now();
     let applied = sync::apply_result_archive(
         &result_path,
         &staging,
@@ -297,6 +313,10 @@ where
         &request_id,
     )?;
 
+    log.line(&format!(
+        "result application: {}ms",
+        application_started.elapsed().as_millis()
+    ));
     log.line(&format!("remote duration: {}ms", applied.duration_ms));
     log.line(&format!("changed files: {}", applied.changed_count));
     if applied.timed_out {

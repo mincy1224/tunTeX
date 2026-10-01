@@ -842,26 +842,16 @@ fn run_job(
         let store = projects::Store::open(&projects_root(config).map_err(ApiError::internal)?)
             .map_err(ApiError::internal)?;
         let previous = store.workspace(project).map_err(ApiError::internal)?;
-        if previous.is_dir() {
-            copy_workspace(&previous, &workspace)?;
-        }
-        let uploaded = uploads.join("workspace");
-        let sources_changed = synchronize_sources(
-            &workspace,
-            &uploaded,
-            &store.sources(project).map_err(ApiError::internal)?,
-            &meta.source_manifest,
-        )?;
         let cache_path = previous.with_extension("result.json");
-        if !sources_changed && cacheable_arguments(&meta.argv) && !cancel.load(Ordering::Acquire) {
-            if let Some(mut cache) = load_cached_build(&cache_path, &signature, &workspace)? {
+        if cacheable_arguments(&meta.argv) && !cancel.load(Ordering::Acquire) {
+            if let Some(mut cache) = load_cached_build(&cache_path, &signature, &previous)? {
                 cache.result.request_id = id;
                 cache.result.duration_ms = 0;
                 let result_path = job.join("result.tar.gz");
                 build_result(
                     config,
                     &result_path,
-                    &workspace,
+                    &previous,
                     &cache.result,
                     &cache.stdout,
                     &cache.stderr,
@@ -870,6 +860,15 @@ fn run_job(
                 return Ok(result_path);
             }
         }
+        if previous.is_dir() {
+            copy_workspace(&previous, &workspace)?;
+        }
+        synchronize_sources(
+            &workspace,
+            &uploads.join("workspace"),
+            &store.sources(project).map_err(ApiError::internal)?,
+            &meta.source_manifest,
+        )?;
     }
     if project.is_none() && uploads.join("workspace").is_dir() {
         copy_workspace(&uploads.join("workspace"), &workspace)?;
@@ -1907,6 +1906,15 @@ fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
                 persistent, prior_generation,
                 "cache hit must not execute or publish a new build"
             );
+            if index == 1 {
+                assert!(
+                    fs::read_dir(job.join("workspace"))
+                        .unwrap()
+                        .next()
+                        .is_none(),
+                    "cache hits must not copy the workspace"
+                );
+            }
         } else {
             assert_ne!(persistent, prior_generation);
         }

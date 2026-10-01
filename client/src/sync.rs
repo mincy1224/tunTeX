@@ -297,6 +297,9 @@ pub fn apply_result_archive(
     // ---- phase 2: apply ------------------------------------------------
     for (relative, staged_path) in &staged.files {
         let target = workspace.join(member_to_relative_path(relative)?.0);
+        if files_match(&target, staged_path).unwrap_or(false) {
+            continue;
+        }
         replace_file(&target, staged_path)?;
     }
 
@@ -322,6 +325,27 @@ pub fn apply_result_archive(
         changed_count: staged.files.len(),
         deleted_count: deletions.len(),
     })
+}
+
+fn files_match(target: &Path, staged: &Path) -> std::io::Result<bool> {
+    let metadata = fs::symlink_metadata(target)?;
+    if !metadata.is_file() || metadata.len() != fs::metadata(staged)?.len() {
+        return Ok(false);
+    }
+    let mut left = std::io::BufReader::new(fs::File::open(target)?);
+    let mut right = std::io::BufReader::new(fs::File::open(staged)?);
+    let mut first = [0u8; 8192];
+    let mut second = [0u8; 8192];
+    loop {
+        let count = left.read(&mut first)?;
+        if count == 0 {
+            return Ok(true);
+        }
+        right.read_exact(&mut second[..count])?;
+        if first[..count] != second[..count] {
+            return Ok(false);
+        }
+    }
 }
 
 fn rebase_paths(bytes: &[u8], remote: &str, local: &str) -> Vec<u8> {
@@ -577,6 +601,25 @@ mod tests {
     }
 
     // -- happy paths -----------------------------------------------------
+
+    #[test]
+    fn identical_results_preserve_existing_file_timestamps() {
+        let scratch = Scratch::new("unchanged");
+        scratch.write_workspace("main.pdf", "same");
+        let path = scratch.0.join("workspace/main.pdf");
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456789);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let archive = ArchiveBuilder::new("req-1")
+            .file("main.pdf", "same")
+            .write(&scratch.0.join("result.tar.gz"));
+        apply(&scratch, &archive, "req-1").unwrap();
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), old);
+    }
 
     #[test]
     fn diagnostics_and_synctex_are_rebased_but_pdf_is_not() {
