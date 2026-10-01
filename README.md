@@ -36,6 +36,10 @@ Keep the executable and its data in one directory, such as /opt/tuntex, writable
 
 ## Client instance
 
+Each invocation synchronizes source additions, edits, and deletions before resolving the build. If sources and compilation conditions match the last cached build, the server returns its artifacts, output, and exit code without running the engine. Missing local products are restored. Failed builds retain their actual diagnostics and nonzero exit code; timeouts and cancellations are not reused. Engine, arguments, working directory, forwarded environment, timeout, and executable identity participate in cache selection. Explicit latexmk force or clean options bypass reuse. After updating TeX packages, use `-g` once to refresh the build.
+
+The client maps remote project paths back to the local workspace in diagnostics, `.log`, `.fls`, `.fdb_latexmk`, and SyncTeX files (including gzip). System TeX paths and binary products remain unchanged.
+
 One executable and its adjacent tun-tex-cfg.yaml form one instance. Client settings are YAML-only; tunTeX environment overrides are not used.
 
 ```yaml

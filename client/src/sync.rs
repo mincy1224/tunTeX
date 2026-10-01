@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -235,6 +235,48 @@ pub fn apply_result_archive(
 
     let metadata = protocol::ResultMetadata::from_bytes(&staged.metadata)?;
     metadata.validate_for(expected_request_id)?;
+    let local_root = workspace.to_string_lossy();
+    let local_root = local_root
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(&local_root)
+        .replace('\\', "/");
+    if !metadata.remote_workspace.is_empty() {
+        for (relative, path) in &staged.files {
+            (|| -> std::io::Result<()> {
+                if relative.ends_with(".synctex.gz") {
+                    let raw = fs::read(path)?;
+                    let mut decoded = Vec::new();
+                    GzDecoder::new(raw.as_slice())
+                        .take(64 * 1024 * 1024 + 1)
+                        .read_to_end(&mut decoded)?;
+                    if decoded.len() > 64 * 1024 * 1024 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "SyncTeX exceeds decompression limit",
+                        ));
+                    }
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(&rebase_paths(
+                        &decoded,
+                        &metadata.remote_workspace,
+                        &local_root,
+                    ))?;
+                    fs::write(path, encoder.finish()?)?;
+                } else if [".log", ".fls", ".fdb_latexmk", ".synctex"]
+                    .iter()
+                    .any(|ext| relative.ends_with(ext))
+                {
+                    fs::write(
+                        path,
+                        rebase_paths(&fs::read(path)?, &metadata.remote_workspace, &local_root),
+                    )?;
+                }
+                Ok(())
+            })()
+            .map_err(|e| Error::protocol(format!("cannot map result paths: {e}")))?;
+        }
+    }
 
     // Every file the metadata claims to have changed must actually be present.
     for relative in &metadata.changed {
@@ -275,16 +317,60 @@ pub fn apply_result_archive(
         timed_out: metadata.timed_out,
         cancelled: metadata.cancelled,
         duration_ms: metadata.duration_ms,
-        stdout: staged.stdout,
-        stderr: staged.stderr,
+        stdout: rebase_paths(&staged.stdout, &metadata.remote_workspace, &local_root),
+        stderr: rebase_paths(&staged.stderr, &metadata.remote_workspace, &local_root),
         changed_count: staged.files.len(),
         deleted_count: deletions.len(),
     })
 }
 
+fn rebase_paths(bytes: &[u8], remote: &str, local: &str) -> Vec<u8> {
+    let native = remote.replace('/', "\\");
+    replace_root(&replace_root(bytes, &native, local), remote, local)
+}
+
+fn replace_root(bytes: &[u8], remote: &str, local: &str) -> Vec<u8> {
+    if remote.is_empty() {
+        return bytes.to_vec();
+    }
+    let needle = remote.as_bytes();
+    let mut output = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor..].starts_with(needle)
+            && bytes
+                .get(cursor + needle.len())
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'_' | b'-' | b'.'))
+        {
+            output.extend_from_slice(local.as_bytes());
+            cursor += needle.len();
+        } else {
+            output.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn path_rebasing_preserves_binary_bytes_and_unrelated_paths() {
+        let bytes = b"\xff /tmp/job/workspace/main.tex /tmp/job/workspace-other/main.tex /usr/share/texlive/file";
+        assert_eq!(
+            rebase_paths(bytes, "/tmp/job/workspace", "E:/project"),
+            b"\xff E:/project/main.tex /tmp/job/workspace-other/main.tex /usr/share/texlive/file"
+        );
+        assert_eq!(
+            rebase_paths(
+                b"C:\\job\\workspace\\main.tex",
+                "C:/job/workspace",
+                "E:/project"
+            ),
+            b"E:/project\\main.tex"
+        );
+    }
     use crate::protocol::{ResultMetadata, PROTOCOL_VERSION};
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -353,6 +439,7 @@ mod tests {
     impl ArchiveBuilder {
         fn new(request_id: &str) -> Self {
             let metadata = ResultMetadata {
+                remote_workspace: String::new(),
                 protocol: PROTOCOL_VERSION,
                 request_id: request_id.to_string(),
                 exit_code: 0,
@@ -490,6 +577,38 @@ mod tests {
     }
 
     // -- happy paths -----------------------------------------------------
+
+    #[test]
+    fn diagnostics_and_synctex_are_rebased_but_pdf_is_not() {
+        let scratch = Scratch::new("rebase");
+        let remote = "/tmp/job/workspace";
+        let input = format!("Input:1:{remote}/main.tex\n");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(input.as_bytes()).unwrap();
+        let mut builder = ArchiveBuilder::new("req-1")
+            .stdout(&format!("{remote}/main.tex:5: error"))
+            .file("main.log", &input)
+            .file("main.pdf", &input)
+            .file("main.synctex.gz", "");
+        builder.files.last_mut().unwrap().1 = encoder.finish().unwrap();
+        let mut metadata: ResultMetadata = serde_json::from_slice(&builder.metadata).unwrap();
+        metadata.remote_workspace = remote.into();
+        metadata.exit_code = 1;
+        builder.metadata = serde_json::to_vec(&metadata).unwrap();
+        let archive = builder.write(&scratch.0.join("result.tar.gz"));
+        let applied = apply(&scratch, &archive, "req-1").unwrap();
+        assert_eq!(applied.exit_code, 1);
+        assert!(!String::from_utf8(applied.stdout).unwrap().contains(remote));
+        assert!(!scratch.read_workspace("main.log").contains(remote));
+        assert_eq!(scratch.read_workspace("main.pdf"), input);
+        let raw = fs::read(scratch.0.join("workspace/main.synctex.gz")).unwrap();
+        let mut decoded = String::new();
+        GzDecoder::new(raw.as_slice())
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert!(!decoded.contains(remote));
+        assert!(decoded.ends_with("/main.tex\n"));
+    }
 
     #[test]
     fn created_files_are_written() {
@@ -753,6 +872,7 @@ mod tests {
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = Builder::new(encoder);
         let metadata = ResultMetadata {
+            remote_workspace: String::new(),
             protocol: PROTOCOL_VERSION,
             request_id: "req-1".to_string(),
             exit_code: 0,

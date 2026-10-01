@@ -219,7 +219,7 @@ struct RequestMeta {
     source_manifest: BTreeMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ResultMeta {
     protocol: u32,
     request_id: Uuid,
@@ -229,9 +229,21 @@ struct ResultMeta {
     duration_ms: u64,
     changed: Vec<String>,
     deleted: Vec<String>,
+    remote_workspace: String,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Serialize, Deserialize)]
+struct CachedBuild {
+    signature: String,
+    result: ResultMeta,
+    #[serde(skip)]
+    stdout: Vec<u8>,
+    #[serde(skip)]
+    stderr: Vec<u8>,
+    files: BTreeMap<String, FileStamp>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct FileStamp {
     size: u64,
     hash: [u8; 32],
@@ -825,7 +837,7 @@ fn run_job(
             "--version" | "-version" | "-v" | "--help" | "-help" | "-h"
         );
     let project = if information_query { None } else { project };
-    let mut sources_changed = false;
+    let signature = build_signature(config, &meta)?;
     if let Some(project) = project {
         let store = projects::Store::open(&projects_root(config).map_err(ApiError::internal)?)
             .map_err(ApiError::internal)?;
@@ -834,12 +846,30 @@ fn run_job(
             copy_workspace(&previous, &workspace)?;
         }
         let uploaded = uploads.join("workspace");
-        sources_changed = synchronize_sources(
+        let sources_changed = synchronize_sources(
             &workspace,
             &uploaded,
             &store.sources(project).map_err(ApiError::internal)?,
             &meta.source_manifest,
         )?;
+        let cache_path = previous.with_extension("result.json");
+        if !sources_changed && cacheable_arguments(&meta.argv) && !cancel.load(Ordering::Acquire) {
+            if let Some(mut cache) = load_cached_build(&cache_path, &signature, &workspace)? {
+                cache.result.request_id = id;
+                cache.result.duration_ms = 0;
+                let result_path = job.join("result.tar.gz");
+                build_result(
+                    config,
+                    &result_path,
+                    &workspace,
+                    &cache.result,
+                    &cache.stdout,
+                    &cache.stderr,
+                    &cache.result.changed,
+                )?;
+                return Ok(result_path);
+            }
+        }
     }
     if project.is_none() && uploads.join("workspace").is_dir() {
         copy_workspace(&uploads.join("workspace"), &workspace)?;
@@ -849,6 +879,14 @@ fn run_job(
         return Err(ApiError::invalid("cwd is not a directory"));
     }
     let before = snapshot(&workspace)?;
+    if meta.engine == "latexmk" && project.is_some() && cacheable_arguments(&meta.argv) {
+        for name in before
+            .keys()
+            .filter(|name| name.ends_with(".fdb_latexmk") || name.ends_with(".fls"))
+        {
+            fs::remove_file(workspace.join(name)).map_err(|e| ApiError::internal(e.to_string()))?;
+        }
+    }
     let engine = config
         .engines
         .get(&meta.engine)
@@ -859,7 +897,7 @@ fn run_job(
         .iter()
         .map(|argument| map_argument(&workspace, argument))
         .collect::<Result<Vec<_>, _>>()?;
-    if meta.engine == "latexmk" && requires_latexmk_refresh(&meta.argv, sources_changed) {
+    if meta.engine == "latexmk" && requires_latexmk_refresh(&meta.argv, project.is_some()) {
         mapped_argv.insert(0, "-g".into());
     }
     let mut command = Command::new(&engine.command);
@@ -870,6 +908,7 @@ fn run_job(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.env("max_print_line", "10000");
     for (key, value) in &meta.env {
         command.env(key, value);
     }
@@ -957,6 +996,7 @@ fn run_job(
         duration_ms: started.elapsed().as_millis() as u64,
         changed: changed.clone(),
         deleted,
+        remote_workspace: workspace.to_string_lossy().replace('\\', "/"),
     };
     let result_path = job.join("result.tar.gz");
     build_result(
@@ -976,15 +1016,138 @@ fn run_job(
         let generation = Uuid::new_v4().to_string();
         let destination = project.join("generations").join(&generation);
         copy_workspace(&workspace, &destination)?;
+        if !timed_out && !cancelled {
+            let cache = CachedBuild {
+                signature,
+                result: result.clone(),
+                stdout,
+                stderr,
+                files: after,
+            };
+            let bytes =
+                serde_json::to_vec(&cache).map_err(|e| ApiError::internal(e.to_string()))?;
+            fs::write(destination.with_extension("result.json"), bytes)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            fs::write(destination.with_extension("stdout.bin"), &cache.stdout)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            fs::write(destination.with_extension("stderr.bin"), &cache.stderr)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        }
         if let Err(error) = store.save_sources(project, &meta.source_manifest, &generation) {
             let _ = fs::remove_dir_all(&destination);
+            for ext in ["result.json", "stdout.bin", "stderr.bin"] {
+                let _ = fs::remove_file(destination.with_extension(ext));
+            }
             return Err(ApiError::invalid(error));
         }
         if previous.is_dir() {
+            for ext in ["result.json", "stdout.bin", "stderr.bin"] {
+                let _ = fs::remove_file(previous.with_extension(ext));
+            }
             let _ = fs::remove_dir_all(previous);
         }
     }
     Ok(result_path)
+}
+
+fn build_signature(config: &Config, meta: &RequestMeta) -> Result<String, ApiError> {
+    let engine = config
+        .engines
+        .get(&meta.engine)
+        .ok_or_else(|| ApiError::invalid("engine is not configured"))?;
+    let executable = if engine.command.is_absolute() {
+        Some(engine.command.clone())
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(&engine.command))
+                .find(|path| path.is_file())
+        })
+    };
+    let identity = executable
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|m| (m.len(), m.modified().ok()));
+    let value = serde_json::to_vec(&(
+        &meta.engine,
+        &engine.command,
+        &engine.args,
+        &meta.argv,
+        &meta.cwd,
+        &meta.env,
+        meta.timeout_seconds,
+        &meta.source_manifest,
+        std::env::var_os("PATH").map(|s| s.to_string_lossy().into_owned()),
+        identity,
+    ))
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(value)))
+}
+
+fn cacheable_arguments(argv: &[String]) -> bool {
+    !argv
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-g" | "-gg" | "-f" | "-c" | "-C" | "-CA"))
+}
+
+#[test]
+fn build_conditions_invalidate_cached_results() {
+    let config = Config::at_directory(Path::new("root"));
+    let mut meta: RequestMeta = serde_json::from_value(serde_json::json!({
+        "protocol": PROTOCOL, "request_id": Uuid::new_v4(), "engine": "latexmk",
+        "argv": ["main.tex"], "cwd": "/workspace", "env": {}, "timeout_seconds": 10,
+        "source_manifest": {}
+    }))
+    .unwrap();
+    let signature = build_signature(&config, &meta).unwrap();
+    meta.request_id = Uuid::new_v4();
+    assert_eq!(signature, build_signature(&config, &meta).unwrap());
+    meta.argv.push("-xelatex".into());
+    assert_ne!(signature, build_signature(&config, &meta).unwrap());
+    meta.argv.pop();
+    meta.env.insert("SOURCE_DATE_EPOCH".into(), "0".into());
+    assert_ne!(signature, build_signature(&config, &meta).unwrap());
+    meta.env.clear();
+    meta.engine = "pdflatex".into();
+    assert_ne!(signature, build_signature(&config, &meta).unwrap());
+    meta.engine = "latexmk".into();
+    meta.cwd = "/workspace/sub".into();
+    assert_ne!(signature, build_signature(&config, &meta).unwrap());
+}
+
+fn load_cached_build(
+    path: &Path,
+    signature: &str,
+    workspace: &Path,
+) -> Result<Option<CachedBuild>, ApiError> {
+    if fs::metadata(path).map_or(true, |m| m.len() > 64 * 1024 * 1024) {
+        return Ok(None);
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return Ok(None);
+    };
+    let Ok(mut cache) = serde_json::from_slice::<CachedBuild>(&bytes) else {
+        return Ok(None);
+    };
+    if cache.signature != signature || cache.result.timed_out || cache.result.cancelled {
+        return Ok(None);
+    }
+    if cache.files != snapshot(workspace)? {
+        return Ok(None);
+    }
+    let stem = path.with_extension("");
+    let stdout = stem.with_extension("stdout.bin");
+    let stderr = stem.with_extension("stderr.bin");
+    let sizes = fs::metadata(&stdout)
+        .and_then(|out| fs::metadata(&stderr).map(|err| out.len().saturating_add(err.len())));
+    if sizes.map_or(true, |size| size > 512 * 1024 * 1024) {
+        return Ok(None);
+    }
+    let (Ok(out), Ok(err)) = (fs::read(stdout), fs::read(stderr)) else {
+        return Ok(None);
+    };
+    cache.stdout = out;
+    cache.stderr = err;
+    Ok(Some(cache))
 }
 
 fn copy_workspace(source: &Path, destination: &Path) -> Result<(), ApiError> {
@@ -1701,6 +1864,7 @@ fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
     let store = projects::Store::open(&registry).unwrap();
     let key = store.register().unwrap();
     let project = store.directory(&key).unwrap();
+    let mut prior_generation = PathBuf::new();
     for (index, query) in [false, false, false, true].into_iter().enumerate() {
         let source = if index < 2 {
             &b"source"[..]
@@ -1738,15 +1902,68 @@ fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
         )
         .unwrap();
         let persistent = store.workspace(&project).unwrap();
+        if index == 1 || query {
+            assert_eq!(
+                persistent, prior_generation,
+                "cache hit must not execute or publish a new build"
+            );
+        } else {
+            assert_ne!(persistent, prior_generation);
+        }
+        prior_generation = persistent.clone();
         assert_eq!(fs::read(persistent.join("main.tex")).unwrap(), source);
         assert!(persistent.join("main.pdf").is_file());
         if !query {
-            assert_eq!(
-                fs::read_to_string(persistent.join("main.pdf"))
-                    .unwrap()
-                    .contains("-g"),
-                index != 1
-            );
+            assert!(fs::read_to_string(persistent.join("main.pdf"))
+                .unwrap()
+                .contains("-g"));
         }
+    }
+}
+
+#[test]
+fn cached_failures_preserve_diagnostics_and_reject_damaged_artifacts() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("main.log"), b"Undefined control sequence").unwrap();
+    let cache_root = tempfile::tempdir().unwrap();
+    let path = cache_root.path().join("build.result.json");
+    let cache = CachedBuild {
+        signature: "conditions".into(),
+        result: ResultMeta {
+            protocol: PROTOCOL,
+            request_id: Uuid::new_v4(),
+            exit_code: 1,
+            timed_out: false,
+            cancelled: false,
+            duration_ms: 1,
+            changed: vec!["main.log".into()],
+            deleted: vec![],
+            remote_workspace: "/tmp/job/workspace".into(),
+        },
+        stdout: b"Undefined control sequence".to_vec(),
+        stderr: vec![],
+        files: snapshot(root.path()).unwrap(),
+    };
+    fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+    fs::write(cache_root.path().join("build.stdout.bin"), &cache.stdout).unwrap();
+    fs::write(cache_root.path().join("build.stderr.bin"), &cache.stderr).unwrap();
+    let restored = load_cached_build(&path, "conditions", root.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.result.exit_code, 1);
+    assert_eq!(restored.stdout, b"Undefined control sequence");
+    assert!(load_cached_build(&path, "different", root.path())
+        .unwrap()
+        .is_none());
+    fs::write(root.path().join("main.log"), b"damaged").unwrap();
+    assert!(load_cached_build(&path, "conditions", root.path())
+        .unwrap()
+        .is_none());
+    fs::remove_file(root.path().join("main.log")).unwrap();
+    assert!(load_cached_build(&path, "conditions", root.path())
+        .unwrap()
+        .is_none());
+    for flag in ["-g", "-gg", "-f", "-c", "-C"] {
+        assert!(!cacheable_arguments(&[flag.into()]));
     }
 }

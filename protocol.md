@@ -41,6 +41,8 @@ files/**
 
 Result metadata contains `exit_code`, `timed_out`, `cancelled`, `duration_ms`, `changed`, and `deleted`. A non-zero LaTeX exit code is compilation data rather than an HTTP error, so the response remains HTTP 200 and the client returns that code unchanged.
 
+`remote_workspace` identifies the project root used in returned diagnostics and text artifacts. Clients rebase it to the local workspace. A reused build has the current request ID, its original output and exit code, and zero engine duration. Its original remote root is retained for rebasing. Source and compilation-condition hashes must match, and stored workspace contents are verified before reuse. Timeouts, cancellations, explicit force builds, and clean commands are not reused.
+
 `DELETE /jobs/{request_id}` cancels an active job. Protocol and request-ID headers must identify the same request, and the bearer key must own the job.
 
 `GET /health` reports liveness. `GET /info` reports the protocol version and built-in engine allowlist.

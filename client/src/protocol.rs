@@ -80,6 +80,8 @@ impl RequestMetadata {
 /// `meta/result.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultMetadata {
+    #[serde(default)]
+    pub remote_workspace: String,
     pub protocol: u32,
     pub request_id: String,
     pub exit_code: i32,
@@ -155,6 +157,7 @@ mod tests {
 
     fn result(request_id: &str, protocol: u32) -> ResultMetadata {
         ResultMetadata {
+            remote_workspace: String::new(),
             protocol,
             request_id: request_id.to_string(),
             exit_code: 0,
