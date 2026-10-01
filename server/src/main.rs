@@ -825,6 +825,7 @@ fn run_job(
             "--version" | "-version" | "-v" | "--help" | "-help" | "-h"
         );
     let project = if information_query { None } else { project };
+    let mut sources_changed = false;
     if let Some(project) = project {
         let store = projects::Store::open(&projects_root(config).map_err(ApiError::internal)?)
             .map_err(ApiError::internal)?;
@@ -833,35 +834,12 @@ fn run_job(
             copy_workspace(&previous, &workspace)?;
         }
         let uploaded = uploads.join("workspace");
-        if uploaded.is_dir() {
-            for name in snapshot(&uploaded)?.keys() {
-                if !meta.source_manifest.contains_key(name) {
-                    return Err(ApiError::invalid(
-                        "uploaded file is absent from source manifest",
-                    ));
-                }
-            }
-            copy_workspace(&uploaded, &workspace)?;
-        }
-        for name in store.sources(project).map_err(ApiError::internal)? {
-            if !meta.source_manifest.contains_key(&name) {
-                let path = workspace.join(clean_relative(&name)?);
-                if path.is_file() {
-                    fs::remove_file(path).map_err(|e| ApiError::internal(e.to_string()))?;
-                }
-            }
-        }
-        for (name, hash) in &meta.source_manifest {
-            let path = workspace.join(clean_relative(name)?);
-            let actual = hash_file(&path).map_err(|_| {
-                ApiError::invalid(format!("missing source {name:?}; retry synchronization"))
-            })?;
-            if actual != *hash {
-                return Err(ApiError::invalid(format!(
-                    "source hash mismatch for {name:?}; retry synchronization"
-                )));
-            }
-        }
+        sources_changed = synchronize_sources(
+            &workspace,
+            &uploaded,
+            &store.sources(project).map_err(ApiError::internal)?,
+            &meta.source_manifest,
+        )?;
     }
     if project.is_none() && uploads.join("workspace").is_dir() {
         copy_workspace(&uploads.join("workspace"), &workspace)?;
@@ -876,11 +854,14 @@ fn run_job(
         .get(&meta.engine)
         .ok_or_else(|| ApiError::invalid("engine is not configured"))?;
     prepare_output_directories(&workspace, &cwd, &meta.argv)?;
-    let mapped_argv = meta
+    let mut mapped_argv = meta
         .argv
         .iter()
         .map(|argument| map_argument(&workspace, argument))
         .collect::<Result<Vec<_>, _>>()?;
+    if meta.engine == "latexmk" && requires_latexmk_refresh(&meta.argv, sources_changed) {
+        mapped_argv.insert(0, "-g".into());
+    }
     let mut command = Command::new(&engine.command);
     command
         .args(&engine.args)
@@ -1034,6 +1015,68 @@ fn copy_workspace(source: &Path, destination: &Path) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+fn synchronize_sources(
+    workspace: &Path,
+    uploads: &Path,
+    previous: &[String],
+    manifest: &BTreeMap<String, String>,
+) -> Result<bool, ApiError> {
+    let mut changed = false;
+    let mut times = BTreeMap::new();
+    for (name, hash) in manifest {
+        let path = workspace.join(clean_relative(name)?);
+        if hash_file(&path).ok().as_ref() != Some(hash) {
+            changed = true;
+            times.insert(name.clone(), std::time::SystemTime::now());
+        } else {
+            let modified = fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            times.insert(name.clone(), modified);
+        }
+    }
+    if uploads.is_dir() {
+        for name in snapshot(uploads)?.keys() {
+            if !manifest.contains_key(name) {
+                return Err(ApiError::invalid(
+                    "uploaded file is absent from source manifest",
+                ));
+            }
+        }
+        copy_workspace(uploads, workspace)?;
+    }
+    for name in previous {
+        if !manifest.contains_key(name) {
+            changed = true;
+            let path = workspace.join(clean_relative(name)?);
+            if path.is_file() {
+                fs::remove_file(path).map_err(|e| ApiError::internal(e.to_string()))?;
+            }
+        }
+    }
+    for (name, hash) in manifest {
+        let path = workspace.join(clean_relative(name)?);
+        if hash_file(&path).ok().as_ref() != Some(hash) {
+            return Err(ApiError::invalid(format!(
+                "source hash mismatch or missing source {name:?}; retry synchronization"
+            )));
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(times[name])))
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    Ok(changed)
+}
+
+fn requires_latexmk_refresh(argv: &[String], sources_changed: bool) -> bool {
+    sources_changed
+        && !argv
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-c" | "-C" | "-g" | "-gg"))
 }
 
 fn prepare_output_directories(
@@ -1545,6 +1588,83 @@ mod tests {
     }
 
     #[test]
+    fn source_sync_tracks_same_size_edits_additions_and_deletions() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let uploads = root.path().join("uploads");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&uploads).unwrap();
+        fs::write(workspace.join("main.tex"), b"BAD").unwrap();
+        fs::write(workspace.join("removed.tex"), b"old").unwrap();
+        fs::write(workspace.join("main.aux"), b"keep").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(workspace.join("main.tex"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        fs::write(uploads.join("main.tex"), b"FIX").unwrap();
+        fs::write(uploads.join("added.tex"), b"new").unwrap();
+        let manifest = BTreeMap::from([
+            ("main.tex".into(), format!("{:x}", Sha256::digest(b"FIX"))),
+            ("added.tex".into(), format!("{:x}", Sha256::digest(b"new"))),
+        ]);
+        assert!(synchronize_sources(
+            &workspace,
+            &uploads,
+            &["main.tex".into(), "removed.tex".into()],
+            &manifest
+        )
+        .unwrap());
+        assert_eq!(fs::read(workspace.join("main.tex")).unwrap(), b"FIX");
+        assert!(!workspace.join("removed.tex").exists());
+        assert!(workspace.join("added.tex").exists());
+        assert_eq!(fs::read(workspace.join("main.aux")).unwrap(), b"keep");
+        let modified = fs::metadata(workspace.join("main.tex"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(modified > std::time::UNIX_EPOCH);
+        assert!(!synchronize_sources(
+            &workspace,
+            &uploads,
+            &manifest.keys().cloned().collect::<Vec<_>>(),
+            &manifest
+        )
+        .unwrap());
+        assert_eq!(
+            modified,
+            fs::metadata(workspace.join("main.tex"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+        let reduced = BTreeMap::from([("main.tex".into(), manifest["main.tex"].clone())]);
+        fs::remove_file(uploads.join("added.tex")).unwrap();
+        assert!(synchronize_sources(
+            &workspace,
+            &uploads,
+            &manifest.keys().cloned().collect::<Vec<_>>(),
+            &reduced
+        )
+        .unwrap());
+        assert!(!workspace.join("added.tex").exists());
+    }
+
+    #[test]
+    fn latexmk_refreshes_after_source_changes_but_preserves_clean_and_incremental_calls() {
+        let argv = vec!["-xelatex".into(), "main.tex".into()];
+        assert!(requires_latexmk_refresh(&argv, true));
+        assert!(!requires_latexmk_refresh(&argv, false));
+        for option in ["-c", "-C", "-g", "-gg"] {
+            assert!(!requires_latexmk_refresh(
+                &[option.into(), "main.tex".into()],
+                true
+            ));
+        }
+    }
+
+    #[test]
     fn defaults_reject_non_latex_engines() {
         let mut config = Config::at_directory(Path::new("root"));
         config.engines.insert(
@@ -1563,7 +1683,7 @@ fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
     let registry = root.path().join("projects");
     let mut config = Config::at_directory(root.path());
     config.server.projects_root = Some(registry.clone());
-    let engine = config.engines.get_mut("xelatex").unwrap();
+    let engine = config.engines.get_mut("latexmk").unwrap();
     #[cfg(windows)]
     {
         engine.command = "cmd.exe".into();
@@ -1572,21 +1692,30 @@ fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
     #[cfg(not(windows))]
     {
         engine.command = "sh".into();
-        engine.args = vec!["-c".into(), "printf product >main.pdf".into()];
+        engine.args = vec![
+            "-c".into(),
+            "printf '%s ' \"$@\" >main.pdf".into(),
+            "mock".into(),
+        ];
     }
     let store = projects::Store::open(&registry).unwrap();
     let key = store.register().unwrap();
     let project = store.directory(&key).unwrap();
-    let manifest = BTreeMap::from([(
-        "main.tex".to_string(),
-        format!("{:x}", Sha256::digest(b"source")),
-    )]);
-    for (index, query) in [false, false, true].into_iter().enumerate() {
+    for (index, query) in [false, false, false, true].into_iter().enumerate() {
+        let source = if index < 2 {
+            &b"source"[..]
+        } else {
+            &b"edited"[..]
+        };
+        let manifest = BTreeMap::from([(
+            "main.tex".to_string(),
+            format!("{:x}", Sha256::digest(source)),
+        )]);
         let job = root.path().join(format!("job-{index}"));
         fs::create_dir(&job).unwrap();
         let id = Uuid::new_v4();
         let archive = job.join("request.tar.gz");
-        let metadata = serde_json::json!({"protocol":PROTOCOL,"request_id":id,"engine":"xelatex","argv":if query {vec!["--version"]} else {vec!["main.tex"]},"cwd":"/workspace","env":{},"timeout_seconds":10,"source_manifest":if query { BTreeMap::new() } else {manifest.clone()}});
+        let metadata = serde_json::json!({"protocol":PROTOCOL,"request_id":id,"engine":"latexmk","argv":if query {vec!["--version"]} else {vec!["main.tex"]},"cwd":"/workspace","env":{},"timeout_seconds":10,"source_manifest":if query { BTreeMap::new() } else {manifest.clone()}});
         let encoder = GzEncoder::new(fs::File::create(&archive).unwrap(), Compression::default());
         let mut builder = Builder::new(encoder);
         append_bytes(
@@ -1595,8 +1724,8 @@ fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
             &serde_json::to_vec(&metadata).unwrap(),
         )
         .unwrap();
-        if index == 0 {
-            append_bytes(&mut builder, "workspace/main.tex", b"source").unwrap();
+        if index == 0 || index == 2 {
+            append_bytes(&mut builder, "workspace/main.tex", source).unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap();
         run_job(
@@ -1609,7 +1738,15 @@ fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
         )
         .unwrap();
         let persistent = store.workspace(&project).unwrap();
-        assert_eq!(fs::read(persistent.join("main.tex")).unwrap(), b"source");
+        assert_eq!(fs::read(persistent.join("main.tex")).unwrap(), source);
         assert!(persistent.join("main.pdf").is_file());
+        if !query {
+            assert_eq!(
+                fs::read_to_string(persistent.join("main.pdf"))
+                    .unwrap()
+                    .contains("-g"),
+                index != 1
+            );
+        }
     }
 }

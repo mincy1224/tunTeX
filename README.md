@@ -64,6 +64,8 @@ Project mode includes all .tex files below the workspace and literal resources r
 
 Referenced .bib and local .bst files are included. Generated auxiliary files stay on the server. Prefer latexmk to orchestrate bibliography tools and multiple passes.
 
+Before each compile, source additions, edits, and deletions are synchronized. Changed sources receive fresh modification times; unchanged sources keep theirs. Source changes automatically trigger a latexmk rebuild so stale failure records cannot suppress recompilation. Unchanged requests retain incremental behavior, and explicit cleaning commands are preserved.
+
 Unreferenced PDFs/images, executables, local build products, and unrelated files are not uploaded. Version-control directories and symlinks are skipped. .tuntexignore filters source discovery. SHA-256 negotiation uploads only missing or changed selected files. If another call changes the cache, the client retries once with the complete selected dependency set.
 
 Dynamic file access is unsupported: do not construct filenames using macros, variables, external programs, or runtime computation. Custom loading commands, unbraced inputs, and resources outside the workspace are unsupported. Static scanning is not a full TeX interpreter; there is no fallback that uploads the entire directory. Text sources must be UTF-8 and at most 16 MiB each. Local latexmk configuration, custom fonts, and files loaded through unsupported commands are not automatically included. PDF/SVG inclusions through includepdf/includesvg are supported.
