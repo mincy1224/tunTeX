@@ -64,7 +64,7 @@ socket 接受 host:port 或 HTTP(S) URL。未知字段会报错。forward_env �
 
 ## 文件选择
 
-项目模式纳入所有 .tex，再收集 input、include、subfile、includegraphics、bibliography、addbibresource、bibliographystyle、documentclass、usepackage、lstinputlisting、VerbatimInput 中的静态引用。请使用花括号文件名与正斜杠。本地 .sty/.cls 继续扫描，支持常见图片扩展名与静态 graphicspath。系统宏包、文档类、样式由服务端 TeX 提供。
+项目模式直接纳入工作区内所有 `.tex`、`.sty`、`.cls`、`.clo`、`.def`、`.cfg`、`.ltx`、`.fd`、`.bbx`、`.cbx`、`.lbx`、`.bib`、`.bst`，仍遵守忽略规则和上传限制，无需显式引用。TeX 支持文件继续递归收集 input、include、subfile、includegraphics、bibliography、addbibresource、bibliographystyle、documentclass、usepackage、lstinputlisting、VerbatimInput 中的静态资源引用。请使用花括号文件名与正斜杠，支持常见图片扩展名与静态 graphicspath。未引用的图片、PDF 和其他杂项文件不上传。系统宏包、文档类、样式由服务端 TeX 提供。
 
 引用的 .bib 与本地 .bst 会上传，生成的辅助文件保留在服务端。推荐 latexmk 处理多轮编译与参考文献。
 

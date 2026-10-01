@@ -64,7 +64,7 @@ Socket accepts host:port or an HTTP(S) URL. Unknown YAML fields are errors. forw
 
 ## File selection
 
-Project mode includes all .tex files below the workspace and literal resources referenced by input, include, subfile, includegraphics, bibliography, addbibresource, bibliographystyle, documentclass, usepackage, lstinputlisting, and VerbatimInput. Use braced filenames and forward slashes. Local .sty/.cls inputs are scanned recursively. Common image extensions and literal graphicspath entries are supported. Missing system packages/classes/styles are supplied by server TeX.
+Project mode includes all local `.tex`, `.sty`, `.cls`, `.clo`, `.def`, `.cfg`, `.ltx`, `.fd`, `.bbx`, `.cbx`, `.lbx`, `.bib`, and `.bst` files below the workspace, subject to ignore rules and upload limits. These files do not need explicit references to be uploaded. TeX support files are scanned recursively for literal resources referenced by input, include, subfile, includegraphics, bibliography, addbibresource, bibliographystyle, documentclass, usepackage, lstinputlisting, and VerbatimInput. Use braced filenames and forward slashes. Common image extensions and literal graphicspath entries are supported. Unreferenced images, PDFs, and unrelated files are not selected. Missing system packages/classes/styles are supplied by server TeX.
 
 Referenced .bib and local .bst files are included. Generated auxiliary files stay on the server. Prefer latexmk to orchestrate bibliography tools and multiple passes.
 

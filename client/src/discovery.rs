@@ -45,11 +45,7 @@ pub fn discover(root: &Path, limit: usize, entry: Option<&Path>) -> Result<BTree
                 if !matches!(entry.file_name().to_str(), Some(".git" | ".hg" | ".svn")) {
                     directories.push(entry.path());
                 }
-            } else if entry
-                .path()
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
-            {
+            } else if kind.is_file() && is_latex_source(&entry.path()) {
                 selected.insert(entry.path());
                 if selected.len() > limit {
                     return Err(Error::config("dependency list exceeds max_file_count"));
@@ -61,7 +57,7 @@ pub fn discover(root: &Path, limit: usize, entry: Option<&Path>) -> Result<BTree
     let graphics = Regex::new(r"\\graphicspath\s*\{((?:\s*\{[^{}]*\}\s*)+)\}").unwrap();
     let group = Regex::new(r"\{([^{}]*)\}").unwrap();
     let mut graphics_search = BTreeSet::new();
-    for source in &selected {
+    for source in selected.iter().filter(|source| is_scannable_source(source)) {
         let text = source_text(source)?;
         for capture in graphics.captures_iter(&text) {
             for path in group.captures_iter(&capture[1]) {
@@ -72,7 +68,11 @@ pub fn discover(root: &Path, limit: usize, entry: Option<&Path>) -> Result<BTree
             }
         }
     }
-    let mut pending: Vec<_> = selected.iter().cloned().collect();
+    let mut pending: Vec<_> = selected
+        .iter()
+        .filter(|source| is_scannable_source(source))
+        .cloned()
+        .collect();
     let mut scanned = BTreeSet::new();
     while let Some(source) = pending.pop() {
         if !scanned.insert(source.clone()) {
@@ -144,12 +144,7 @@ pub fn discover(root: &Path, limit: usize, entry: Option<&Path>) -> Result<BTree
                     }
                 }
                 if let Some(path) = found {
-                    if selected.insert(path.clone())
-                        && matches!(
-                            path.extension().and_then(|e| e.to_str()),
-                            Some("tex" | "sty" | "cls")
-                        )
-                    {
+                    if selected.insert(path.clone()) && is_scannable_source(&path) {
                         pending.push(path);
                     }
                 } else if !optional_system {
@@ -165,6 +160,25 @@ pub fn discover(root: &Path, limit: usize, entry: Option<&Path>) -> Result<BTree
         }
     }
     Ok(selected)
+}
+
+fn is_latex_source(path: &Path) -> bool {
+    is_scannable_source(path)
+        || path.extension().is_some_and(|ext| {
+            ["bib", "bst"]
+                .iter()
+                .any(|name| ext.eq_ignore_ascii_case(name))
+        })
+}
+
+fn is_scannable_source(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        [
+            "tex", "sty", "cls", "clo", "def", "cfg", "ltx", "fd", "bbx", "cbx", "lbx",
+        ]
+        .iter()
+        .any(|name| ext.eq_ignore_ascii_case(name))
+    })
 }
 
 fn source_text(source: &Path) -> Result<String> {
@@ -201,6 +215,36 @@ fn strip_comments(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_support_files_are_selected_without_explicit_references() {
+        let root = std::env::temp_dir().join(format!("tuntex-discovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("theme")).unwrap();
+        std::fs::write(root.join("main.tex"), "\\usetheme{MyPre}").unwrap();
+        std::fs::write(root.join("beamerthemeMyPre.sty"), "\\includegraphics{logo}").unwrap();
+        std::fs::write(root.join("logo.png"), b"image").unwrap();
+        for name in [
+            "theme/local.CLS",
+            "theme/local.def",
+            "theme/refs.bib",
+            "theme/style.bst",
+            "theme/local.bbx",
+        ] {
+            std::fs::write(root.join(name), b"support").unwrap();
+        }
+        std::fs::write(root.join("unrelated.pdf"), b"excluded").unwrap();
+        std::fs::write(root.join(".tuntexignore"), "theme/local.def\n").unwrap();
+        let selected = discover(&root, 100, None).unwrap();
+        assert_eq!(selected.len(), 7);
+        assert!(selected
+            .iter()
+            .any(|path| path.ends_with("beamerthemeMyPre.sty")));
+        assert!(selected.iter().any(|path| path.ends_with("logo.png")));
+        assert!(!selected.iter().any(|path| path.ends_with("local.def")));
+        assert!(!selected.iter().any(|path| path.ends_with("unrelated.pdf")));
+        assert!(discover(&root, 2, None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn resources_are_selected_but_unrelated_files_are_not() {
