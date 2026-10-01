@@ -24,7 +24,7 @@ use flate2::Compression;
 use tar::{Archive, Builder, Header};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_tuntex-client");
-const PROTOCOL_VERSION: &str = "1";
+const PROTOCOL_VERSION: &str = "2";
 
 // ---------------------------------------------------------------------------
 // scratch directories
@@ -149,6 +149,15 @@ impl MockServer {
                         stream.set_nonblocking(false).unwrap();
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                         if let Ok(Some(request)) = handle_connection(&mut stream) {
+                            if request.target == "/manifest" {
+                                let manifest: BTreeMap<String, String> =
+                                    serde_json::from_slice(&request.body).unwrap();
+                                let body =
+                                    serde_json::to_string(&manifest.keys().collect::<Vec<_>>())
+                                        .unwrap();
+                                let _ = write_reply(&mut stream, Reply::Status { code: 200, body });
+                                continue;
+                            }
                             let reply = handler(&request);
                             thread_received.lock().unwrap().push(request);
                             let _ = write_reply(&mut stream, reply);
@@ -331,7 +340,7 @@ impl ResultArchive {
             files: Vec::new(),
             declared_changed: Vec::new(),
             deleted: Vec::new(),
-            protocol: 1,
+            protocol: 2,
         }
     }
 
@@ -445,20 +454,35 @@ fn run_client(scratch: &Scratch, url: &str, args: &[&str], env: &[(&str, &str)])
     let engine = env
         .iter()
         .find_map(|(name, value)| (*name == "TUNTEX_ENGINE").then_some(*value));
-    let executable = engine
-        .map(|name| {
-            let path = scratch.root.join(format!("{name}.exe"));
-            if !path.exists() {
-                std::fs::copy(BINARY, &path).unwrap();
+    let name = engine.unwrap_or("tuntex-client");
+    let executable = scratch.root.join(format!("{name}.exe"));
+    std::fs::copy(BINARY, &executable).unwrap();
+    let mut config = serde_json::json!({"socket":url,"tex":engine.unwrap_or("xelatex"),"workspace":scratch.workspace_string(),"project_key":"test-key"});
+    for (name, value) in env {
+        let field = match *name {
+            "TUNTEX_TOKEN" => "project_key",
+            "TUNTEX_DEBUG" => "debug",
+            "TUNTEX_TIMEOUT" => "timeout_seconds",
+            "TUNTEX_MAX_UPLOAD_SIZE" => "max_upload_size",
+            "TUNTEX_CWD" => "cwd",
+            "TUNTEX_WORKSPACE" => "workspace",
+            "TUNTEX_FORWARD_ENV" => "forward_env",
+            _ => continue,
+        };
+        config[field] = match field {
+            "debug" => serde_json::json!(*value == "1"),
+            "timeout_seconds" | "max_upload_size" => {
+                serde_json::json!(value.parse::<u64>().unwrap())
             }
-            std::fs::write(
-                scratch.root.join("tun-tex-cfg.yaml"),
-                format!("socket: {url}\ntex: {name}\n"),
-            )
-            .unwrap();
-            path
-        })
-        .unwrap_or_else(|| PathBuf::from(BINARY));
+            "forward_env" => serde_json::json!(value.split([',', ';']).collect::<Vec<_>>()),
+            _ => serde_json::json!(value),
+        };
+    }
+    std::fs::write(
+        scratch.root.join("tun-tex-cfg.yaml"),
+        serde_yaml::to_string(&config).unwrap(),
+    )
+    .unwrap();
     let mut command = Command::new(executable);
     for argument in args {
         command.arg(argument);
@@ -615,7 +639,7 @@ fn the_uploaded_request_describes_the_compile() {
     assert!(request.header("x-tuntex-request-id").is_some());
 
     let (metadata, members) = decode_request(&request.body);
-    assert_eq!(metadata["protocol"], 1);
+    assert_eq!(metadata["protocol"], 2);
     assert_eq!(metadata["engine"], "latexmk");
     assert_eq!(metadata["cwd"], "/workspace");
     assert_eq!(
@@ -780,7 +804,7 @@ fn an_authentication_failure_has_its_own_exit_code() {
     let run = run_latexmk(&scratch, &server.base_url(), &["main.tex"], &[]);
 
     assert_eq!(run.code, 77);
-    assert!(run.stderr_text().contains("TUNTEX_TOKEN"));
+    assert!(run.stderr_text().contains("project_key"));
 }
 
 #[test]
@@ -861,10 +885,7 @@ fn a_path_outside_the_workspace_is_refused_before_any_request() {
 
     assert_eq!(run.code, 64);
     let stderr = run.stderr_text();
-    assert!(
-        stderr.contains("outside TUNTEX_WORKSPACE"),
-        "stderr was: {stderr}"
-    );
+    assert!(stderr.contains("outside workspace"), "stderr was: {stderr}");
     assert!(stderr.contains("refs.bib"));
     assert_eq!(
         server.request_count(),
@@ -889,10 +910,11 @@ fn an_unreachable_service_is_reported_clearly() {
 #[test]
 fn a_missing_client_config_is_a_configuration_error() {
     let scratch = Scratch::new("no-engine");
-    let run = run_client(&scratch, "http://127.0.0.1:1", &["main.tex"], &[]);
-
-    assert_eq!(run.code, 64);
-    assert!(run.stderr_text().contains("tun-tex-cfg.yaml"));
+    let shim = scratch.root.join("tuntex-client.exe");
+    std::fs::copy(BINARY, &shim).unwrap();
+    let output = Command::new(shim).arg("main.tex").output().unwrap();
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tun-tex-cfg.yaml"));
 }
 
 #[test]
@@ -911,7 +933,11 @@ fn the_engine_is_inferred_from_the_executable_name() {
     std::fs::copy(BINARY, &shim).unwrap();
     std::fs::write(
         scratch.root.join("tun-tex-cfg.yaml"),
-        format!("socket: {}\ntex: xelatex\n", server.base_url()),
+        format!(
+            "socket: {}\ntex: xelatex\nproject_key: test-key\nworkspace: '{}'\n",
+            server.base_url(),
+            scratch.workspace_string()
+        ),
     )
     .unwrap();
     let output = Command::new(&shim)
@@ -1023,7 +1049,7 @@ fn unicode_workspace_content_round_trips() {
 }
 
 #[test]
-fn a_build_product_from_a_previous_run_is_uploaded() {
+fn local_build_products_are_not_uploaded() {
     // Incremental latexmk depends on seeing the previous run's .aux/.fls files.
     let scratch = Scratch::new("incremental");
     scratch.write("main.tex", "x");
@@ -1043,8 +1069,8 @@ fn a_build_product_from_a_previous_run_is_uploaded() {
     assert_eq!(run.code, 0, "stderr: {}", run.stderr_text());
 
     let (_, members) = decode_request(&server.wait_for_request().body);
-    assert!(members.contains(&"workspace/main.aux".to_string()));
-    assert!(members.contains(&"workspace/main.fdb_latexmk".to_string()));
+    assert!(!members.contains(&"workspace/main.aux".to_string()));
+    assert!(!members.contains(&"workspace/main.fdb_latexmk".to_string()));
     assert!(
         !members.iter().any(|name| name.contains(".git")),
         "version-control metadata must be excluded"
@@ -1146,7 +1172,7 @@ fn the_compile_timeout_is_sent_to_the_server() {
 #[test]
 fn an_oversized_workspace_is_refused_locally() {
     let scratch = Scratch::new("too-big");
-    scratch.write("big.bin", &"x".repeat(4096));
+    scratch.write("main.tex", &"x".repeat(4096));
     let server = MockServer::start(Box::new(|request| {
         let id = request.header("x-tuntex-request-id").unwrap().to_string();
         Reply::Ok {
@@ -1163,6 +1189,76 @@ fn an_oversized_workspace_is_refused_locally() {
     );
 
     assert_eq!(run.code, 64);
-    assert!(run.stderr_text().contains("TUNTEX_MAX_UPLOAD_SIZE"));
+    assert!(run.stderr_text().contains("max_upload_size"));
     assert_eq!(server.request_count(), 0, "nothing should be uploaded");
+}
+
+#[test]
+fn version_queries_upload_no_sources_or_write_query_artifacts() {
+    let scratch = Scratch::new("query");
+    scratch.write("unrelated.tex", "\\input{missing}");
+    scratch.write("huge.exe", &"x".repeat(4096));
+    let server = MockServer::start(Box::new(|request| {
+        let (metadata, members) = decode_request(&request.body);
+        assert!(metadata["source_manifest"].as_object().unwrap().is_empty());
+        assert!(!members.iter().any(|name| name.starts_with("workspace/")));
+        let id = request.header("x-tuntex-request-id").unwrap().to_string();
+        Reply::Ok {
+            body: ResultArchive::new(&id)
+                .stdout(b"engine version\n")
+                .file("query.pdf", "discard")
+                .build(),
+            request_id: Some(id),
+        }
+    }));
+    let run = run_latexmk(
+        &scratch,
+        &server.base_url(),
+        &["--version"],
+        &[("TUNTEX_MAX_UPLOAD_SIZE", "512")],
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr_text());
+    assert_eq!(run.stdout, b"engine version\n");
+    assert!(!scratch.exists("query.pdf"));
+    assert!(!scratch.root.join("query.pdf").exists());
+}
+
+#[test]
+fn client_environment_overrides_do_not_change_instance_configuration() {
+    let scratch = Scratch::new("yaml-only");
+    scratch.write("main.tex", "source");
+    let server = MockServer::start(Box::new(|request| {
+        let id = request.header("x-tuntex-request-id").unwrap().to_string();
+        Reply::Ok {
+            body: ResultArchive::new(&id).build(),
+            request_id: Some(id),
+        }
+    }));
+    let run = run_latexmk(
+        &scratch,
+        &server.base_url(),
+        &["main.tex"],
+        &[("TUNTEX_URL", "http://127.0.0.1:1")],
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr_text());
+    assert_eq!(server.request_count(), 1);
+}
+
+#[test]
+fn missing_project_workspace_cannot_fall_back_to_the_environment() {
+    let scratch = Scratch::new("required-workspace");
+    let executable = scratch.root.join("tuntex-client.exe");
+    std::fs::copy(BINARY, &executable).unwrap();
+    std::fs::write(
+        scratch.root.join("tun-tex-cfg.yaml"),
+        "socket: 127.0.0.1:1\ntex: xelatex\nproject_key: test-key\nworkspace: null\n",
+    )
+    .unwrap();
+    let output = Command::new(executable)
+        .arg("main.tex")
+        .env("TUNTEX_WORKSPACE", scratch.workspace_string())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("explicit workspace"));
 }
