@@ -126,7 +126,7 @@ impl PathMapper {
             return Err(Error::config(format!(
                 "argument contains a relative path with '..', which would escape the \
                  uploaded workspace: {value}\n\
-                 paths must stay inside TUNTEX_WORKSPACE"
+                 paths must stay inside workspace"
             )));
         }
 
@@ -149,10 +149,10 @@ impl PathMapper {
                 .all(|(a, b)| segment_eq(a, b))
         {
             return Err(Error::config(format!(
-                "argument contains a path outside TUNTEX_WORKSPACE:\n  \
+                "argument contains a path outside workspace:\n  \
                  path:      {text}\n  \
                  workspace: {}\n\
-                 move the file into the workspace, or adjust TUNTEX_WORKSPACE",
+                 move the file into the workspace, or adjust workspace",
                 self.workspace.display()
             )));
         }
@@ -220,7 +220,12 @@ fn normalise(path: &Path) -> Vec<OsString> {
 
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => segments.push(prefix.as_os_str().to_os_string()),
+            Component::Prefix(prefix) => match prefix.kind() {
+                std::path::Prefix::Disk(drive) | std::path::Prefix::VerbatimDisk(drive) => {
+                    segments.push(OsString::from(format!("{}:", drive as char)));
+                }
+                _ => segments.push(prefix.as_os_str().to_os_string()),
+            },
             Component::RootDir => segments.push(OsString::from(ROOT_SENTINEL)),
             Component::CurDir => {}
             Component::ParentDir => {
@@ -448,4 +453,15 @@ mod tests {
             "/workspace/chapters"
         );
     }
+}
+#[cfg(windows)]
+#[test]
+fn canonical_windows_prefix_matches_an_ordinary_drive_path() {
+    let mapper = PathMapper::new(Path::new(r"\\?\E:\Documents\paper")).unwrap();
+    assert_eq!(
+        mapper
+            .map_argument(OsStr::new("E:/Documents/paper/main.tex"))
+            .unwrap(),
+        "/workspace/main.tex"
+    );
 }

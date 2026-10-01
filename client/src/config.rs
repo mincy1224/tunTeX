@@ -23,11 +23,15 @@ struct ClientFileConfig {
     socket: String,
     tex: String,
     #[serde(default)]
+    input_mode: InputMode,
+    #[serde(default)]
     workspace: Option<PathBuf>,
     #[serde(default)]
     cwd: Option<PathBuf>,
-    #[serde(default)]
+    #[serde(skip)]
     token: Option<String>,
+    #[serde(default)]
+    project_key: Option<String>,
     #[serde(default)]
     timeout_seconds: Option<u64>,
     #[serde(default)]
@@ -38,8 +42,14 @@ struct ClientFileConfig {
     max_file_count: Option<usize>,
     #[serde(default)]
     debug: Option<bool>,
-    #[serde(default)]
-    keep_temp: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InputMode {
+    #[default]
+    Project,
+    Temporary,
 }
 
 /// Engine names the proxy recognises when inferring from the executable name.
@@ -57,7 +67,12 @@ pub const KNOWN_ENGINES: [&str; 7] = [
 ///
 /// The client-side mirror of the server's own blocklist.  These are checked
 /// before anything is sent so the failure is local and immediate.
-pub const FORBIDDEN_FORWARD: [&str; 13] = [
+pub const FORBIDDEN_FORWARD: [&str; 18] = [
+    "HOME",
+    "TMPDIR",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
     "PATH",
     "TEMP",
     "TMP",
@@ -76,6 +91,7 @@ pub const FORBIDDEN_FORWARD: [&str; 13] = [
 /// Fully resolved client settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    pub input_mode: InputMode,
     pub url: String,
     pub engine: String,
     /// Absolute Windows path of the project root that gets uploaded.
@@ -93,8 +109,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read configuration from the process environment.
+    /// Read the adjacent instance YAML.
     pub fn from_env(exe_name: &OsStr) -> Result<Self> {
+        Self::from_invocation(exe_name, &[], false)
+    }
+
+    pub fn from_invocation(
+        exe_name: &OsStr,
+        arguments: &[std::ffi::OsString],
+        information: bool,
+    ) -> Result<Self> {
         let executable = std::env::current_exe().map_err(|error| {
             Error::config(format!("could not locate the client executable: {error}"))
         })?;
@@ -108,166 +132,134 @@ impl Config {
                 path.display()
             ))
         })?;
-        let file: ClientFileConfig = serde_yaml::from_str(&raw).map_err(|error| {
+        let mut file: ClientFileConfig = serde_yaml::from_str(&raw).map_err(|error| {
             Error::config(format!(
                 "client config {} is not valid YAML: {error}",
                 path.display()
             ))
         })?;
-        Self::from_sources(exe_name, &|_| None, Some(file))
-    }
-
-    /// Read configuration from an arbitrary lookup, so tests need not mutate
-    /// the real process environment.
-    pub fn from_lookup(exe_name: &OsStr, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
-        Self::from_sources(exe_name, lookup, None)
-    }
-
-    fn from_sources(
-        exe_name: &OsStr,
-        lookup: &dyn Fn(&str) -> Option<String>,
-        file: Option<ClientFileConfig>,
-    ) -> Result<Self> {
-        let (engine, configured_url) = match &file {
-            Some(file) => {
-                let engine = validate_configured_engine(exe_name, &file.tex)?;
-                let socket = file.socket.trim();
-                if socket.is_empty() {
-                    return Err(Error::config("client config 'socket' must not be empty"));
-                }
-                let url = if socket.starts_with("http://") || socket.starts_with("https://") {
-                    socket.to_string()
-                } else {
-                    format!("http://{socket}")
-                };
-                (engine, url)
+        validate_configured_engine(exe_name, &file.tex)?;
+        if let Some(key) = file.project_key.take() {
+            if key.trim().is_empty() {
+                return Err(Error::config("project_key must not be empty"));
             }
-            None => (
-                resolve_engine(exe_name)?,
-                lookup("TUNTEX_URL").unwrap_or_else(|| DEFAULT_URL.to_string()),
-            ),
+            file.token = Some(key);
+        } else {
+            return Err(Error::config(
+                "project_key is required in the instance YAML",
+            ));
+        }
+        if information {
+            file.workspace = Some(directory.to_path_buf());
+            file.cwd = Some(directory.to_path_buf());
+        } else if file.input_mode == InputMode::Temporary {
+            let current = std::env::current_dir().map_err(|e| Error::config(e.to_string()))?;
+            let inputs: Vec<_> = arguments
+                .iter()
+                .filter(|argument| {
+                    Path::new(argument)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
+                })
+                .collect();
+            if inputs.len() != 1 {
+                return Err(Error::config(
+                    "temporary mode requires exactly one .tex input",
+                ));
+            }
+            let entry = current
+                .join(inputs[0])
+                .canonicalize()
+                .map_err(|e| Error::config(format!("cannot resolve temporary input: {e}")))?;
+            file.workspace = Some(entry.parent().unwrap().to_path_buf());
+            file.cwd = file.workspace.clone();
+        } else if file.workspace.is_none() {
+            return Err(Error::config(
+                "project mode requires an explicit workspace in YAML",
+            ));
+        }
+        let root = file
+            .workspace
+            .as_ref()
+            .unwrap()
+            .canonicalize()
+            .map_err(|e| Error::config(format!("cannot resolve workspace: {e}")))?;
+        let system_directory = std::env::var_os("SystemRoot")
+            .and_then(|path| crate::pathmap::PathMapper::new(Path::new(&path)).ok())
+            .is_some_and(|mapper| mapper.contains(&root));
+        if root.parent().is_none() || system_directory {
+            return Err(Error::config("workspace must be a document directory, not a filesystem root or Windows directory"));
+        }
+        Self::from_file(exe_name, file)
+    }
+
+    fn from_file(exe_name: &OsStr, file: ClientFileConfig) -> Result<Self> {
+        let engine = validate_configured_engine(exe_name, &file.tex)?;
+        let socket = file.socket.trim();
+        if socket.is_empty() {
+            return Err(Error::config("socket must not be empty"));
+        }
+        let url = if socket.starts_with("http://") || socket.starts_with("https://") {
+            socket.to_string()
+        } else {
+            format!("http://{socket}")
         };
-
-        let workspace_raw = lookup("TUNTEX_WORKSPACE")
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                file.as_ref()
-                    .and_then(|config| config.workspace.as_ref())
-                    .map(|path| path.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            });
-        let workspace = PathBuf::from(&workspace_raw);
-        if !workspace.is_absolute() {
-            return Err(Error::config(format!(
-                "TUNTEX_WORKSPACE must be an absolute path: {workspace_raw}"
-            )));
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|e| Error::config(format!("invalid socket URL: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(Error::config(
+                "socket must be an HTTP(S) URL without credentials, query, or fragment",
+            ));
         }
-        if !workspace.is_dir() {
-            return Err(Error::config(format!(
-                "TUNTEX_WORKSPACE is not an existing directory: {workspace_raw}"
-            )));
+        let workspace = file
+            .workspace
+            .ok_or_else(|| Error::config("workspace is required"))?;
+        if !workspace.is_absolute() || !workspace.is_dir() {
+            return Err(Error::config(
+                "workspace must be an existing absolute directory",
+            ));
         }
-
-        let cwd = match lookup("TUNTEX_CWD").or_else(|| {
-            file.as_ref()
-                .and_then(|config| config.cwd.as_ref())
-                .map(|path| path.to_string_lossy().into_owned())
-        }) {
-            Some(value) if !value.trim().is_empty() => PathBuf::from(value),
-            _ => workspace.clone(),
-        };
-        if !cwd.is_absolute() {
-            return Err(Error::config(format!(
-                "TUNTEX_CWD must be an absolute path: {}",
-                cwd.display()
-            )));
+        let cwd = file.cwd.unwrap_or_else(|| workspace.clone());
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err(Error::config("cwd must be an existing absolute directory"));
         }
-
-        let url = lookup("TUNTEX_URL")
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(configured_url);
-        if url.trim().is_empty() {
-            return Err(Error::config("client config 'socket' must not be empty"));
+        if !crate::pathmap::PathMapper::new(&workspace)?.contains(&cwd) {
+            return Err(Error::config("cwd must stay inside workspace"));
         }
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(Error::config(format!(
-                "TUNTEX_URL must start with http:// or https://: {url}"
-            )));
+        let timeout_seconds = file.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+        let max_upload_size = file.max_upload_size.unwrap_or(DEFAULT_MAX_UPLOAD_SIZE);
+        let max_file_count = file.max_file_count.unwrap_or(DEFAULT_MAX_FILE_COUNT);
+        if timeout_seconds == 0 || max_upload_size == 0 || max_file_count == 0 {
+            return Err(Error::config(
+                "timeout_seconds, max_upload_size, and max_file_count must be positive",
+            ));
         }
-
-        let timeout_seconds = parse_u64(
-            lookup,
-            "TUNTEX_TIMEOUT",
-            file.as_ref()
-                .and_then(|config| config.timeout_seconds)
-                .unwrap_or(DEFAULT_TIMEOUT_SECONDS),
-        )?;
-        if timeout_seconds == 0 {
-            return Err(Error::config("TUNTEX_TIMEOUT must be greater than zero"));
+        for name in &file.forward_env {
+            check_forwardable(name)?;
         }
-        let max_upload_size = parse_u64(
-            lookup,
-            "TUNTEX_MAX_UPLOAD_SIZE",
-            file.as_ref()
-                .and_then(|config| config.max_upload_size)
-                .unwrap_or(DEFAULT_MAX_UPLOAD_SIZE),
-        )?;
-        if max_upload_size == 0 {
-            return Err(Error::config("max_upload_size must be greater than zero"));
-        }
-        let max_file_count = parse_u64(
-            lookup,
-            "TUNTEX_MAX_FILE_COUNT",
-            file.as_ref()
-                .and_then(|config| config.max_file_count)
-                .unwrap_or(DEFAULT_MAX_FILE_COUNT) as u64,
-        )?;
-        let max_file_count = usize::try_from(max_file_count)
-            .map_err(|_| Error::config("TUNTEX_MAX_FILE_COUNT is too large for this platform"))?;
-        if max_file_count == 0 {
-            return Err(Error::config("max_file_count must be greater than zero"));
-        }
-
-        let token = lookup("TUNTEX_TOKEN")
-            .or_else(|| file.as_ref().and_then(|config| config.token.clone()))
-            .filter(|value| !value.is_empty());
-
-        let forward_env = lookup("TUNTEX_FORWARD_ENV")
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| split_list(&value))
-            .unwrap_or_else(|| {
-                file.as_ref()
-                    .map(|config| config.forward_env.clone())
-                    .unwrap_or_default()
-            });
-
-        let debug = parse_bool_optional(lookup, "TUNTEX_DEBUG")?
-            .or_else(|| file.as_ref().and_then(|config| config.debug))
-            .unwrap_or(false);
-        let keep_temp = parse_bool_optional(lookup, "TUNTEX_KEEP_TEMP")?
-            .or_else(|| file.as_ref().and_then(|config| config.keep_temp))
-            .unwrap_or(false);
-
         Ok(Self {
-            url: url.trim_end_matches('/').to_string(),
+            input_mode: file.input_mode,
+            url: url.trim_end_matches('/').into(),
             engine,
             workspace,
             cwd,
             timeout_seconds,
-            token,
-            debug,
-            forward_env,
+            token: file.project_key.or(file.token),
+            debug: file.debug.unwrap_or(false),
+            forward_env: file.forward_env,
             max_upload_size,
             max_file_count,
-            keep_temp,
+            keep_temp: false,
         })
     }
 
-    /// Collect the environment variables requested by `TUNTEX_FORWARD_ENV`.
+    /// Collect explicitly allowed engine environment variables.
     ///
     /// A name that is not set is skipped rather than sent as empty: the server
     /// should inherit its own value rather than be told the variable is blank.
@@ -288,37 +280,10 @@ fn check_forwardable(name: &str) -> Result<()> {
     let upper = name.to_ascii_uppercase();
     if FORBIDDEN_FORWARD.contains(&upper.as_str()) {
         return Err(Error::config(format!(
-            "TUNTEX_FORWARD_ENV lists {name}, which must not be forwarded to the remote service"
+            "forward_env lists {name}, which must not be forwarded to the remote service"
         )));
     }
     Ok(())
-}
-
-/// Work out which backend to ask for.
-///
-/// Precedence: `TUNTEX_ENGINE`, then the executable's own name (so the
-/// binary can be copied to `xelatex.exe` and act as a drop-in shim), then an
-/// error -- never a guess.
-fn resolve_engine(exe_name: &OsStr) -> Result<String> {
-    let stem = Path::new(exe_name)
-        .file_stem()
-        .map(|value| value.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-
-    if KNOWN_ENGINES.contains(&stem.as_str()) {
-        return Ok(stem);
-    }
-
-    let exe_display = Path::new(exe_name)
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| exe_name.to_string_lossy().into_owned());
-
-    Err(Error::config(format!(
-        "invalid client executable name {exe_display:?}; expected one of {}. \
-         Rename or hard-link tuntex-client to <engine>.exe",
-        KNOWN_ENGINES.join(", ")
-    )))
 }
 
 fn validate_configured_engine(exe_name: &OsStr, configured: &str) -> Result<String> {
@@ -346,278 +311,130 @@ fn validate_configured_engine(exe_name: &OsStr, configured: &str) -> Result<Stri
     Ok(engine)
 }
 
-fn parse_u64(lookup: &dyn Fn(&str) -> Option<String>, name: &str, default: u64) -> Result<u64> {
-    match lookup(name) {
-        Some(value) if !value.trim().is_empty() => value.trim().parse::<u64>().map_err(|_| {
-            Error::config(format!("{name} must be a positive integer, got {value:?}"))
-        }),
-        _ => Ok(default),
-    }
-}
-
-fn parse_bool_optional(
-    lookup: &dyn Fn(&str) -> Option<String>,
-    name: &str,
-) -> Result<Option<bool>> {
-    match lookup(name) {
-        Some(value) if !value.trim().is_empty() => match value.trim().to_ascii_lowercase().as_str()
-        {
-            "1" | "true" | "yes" | "on" => Ok(Some(true)),
-            "0" | "false" | "no" | "off" => Ok(Some(false)),
-            other => Err(Error::config(format!(
-                "{name} must be a boolean-ish value (0/1/true/false), got {other:?}"
-            ))),
-        },
-        _ => Ok(None),
-    }
-}
-
-/// Split a comma or semicolon separated list, dropping blanks.
-fn split_list(value: &str) -> Vec<String> {
-    value
-        .split([',', ';'])
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lookup_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |key: &str| {
-            pairs
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| (*value).to_string())
-        }
+    fn file(yaml: &str) -> ClientFileConfig {
+        serde_yaml::from_str(yaml).unwrap()
     }
 
-    fn config_from(exe: &str, pairs: &[(&str, &str)]) -> Result<Config> {
-        let lookup = lookup_from(pairs);
-        Config::from_lookup(OsStr::new(exe), &lookup)
-    }
-
-    #[test]
-    fn engine_override_cannot_bypass_executable_allowlist() {
-        let error = config_from(
-            "not-an-engine.exe",
-            &[
-                ("TUNTEX_ENGINE", "latexmk"),
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-            ],
-        )
-        .unwrap_err();
-        assert!(error.message().contains("invalid client executable name"));
-    }
-
-    #[test]
-    fn configured_engine_is_strictly_validated() {
-        assert_eq!(
-            validate_configured_engine(OsStr::new("tuntex-client.exe"), "xelatex").unwrap(),
-            "xelatex"
-        );
-        assert!(validate_configured_engine(OsStr::new("tuntex-client.exe"), "cmd").is_err());
-        assert!(validate_configured_engine(OsStr::new("random.exe"), "xelatex").is_err());
-        assert!(validate_configured_engine(OsStr::new("pdflatex.exe"), "xelatex").is_err());
-    }
-
-    #[test]
-    fn yaml_can_define_every_client_setting() {
-        let raw = format!(
-            "socket: example.test:9000\n\
-             tex: xelatex\n\
-             workspace: '{}'\n\
-             cwd: '{}'\n\
-             token: secret\n\
-             timeout_seconds: 45\n\
-             forward_env: [TEXINPUTS, SOURCE_DATE_EPOCH]\n\
-             max_upload_size: 123456\n\
-             max_file_count: 321\n\
-             debug: true\n\
-             keep_temp: true\n",
-            env!("CARGO_MANIFEST_DIR"),
+    fn base() -> String {
+        format!(
+            "socket: 127.0.0.1:38117\ntex: latexmk\nproject_key: secret\nworkspace: '{}'\n",
             env!("CARGO_MANIFEST_DIR")
-        );
-        let file: ClientFileConfig = serde_yaml::from_str(&raw).unwrap();
-        let config =
-            Config::from_sources(OsStr::new("tuntex-client.exe"), &|_| None, Some(file)).unwrap();
-        assert_eq!(config.url, "http://example.test:9000");
-        assert_eq!(config.engine, "xelatex");
-        assert_eq!(config.timeout_seconds, 45);
-        assert_eq!(config.token.as_deref(), Some("secret"));
-        assert_eq!(config.forward_env, ["TEXINPUTS", "SOURCE_DATE_EPOCH"]);
-        assert_eq!(config.max_upload_size, 123456);
-        assert_eq!(config.max_file_count, 321);
-        assert!(config.debug);
-        assert!(config.keep_temp);
+        )
     }
 
     #[test]
-    fn engine_is_inferred_from_the_executable_name() {
+    fn yaml_defaults_are_applied() {
+        let config = Config::from_file(OsStr::new("tuntex-client.exe"), file(&base())).unwrap();
+        assert_eq!(config.url, DEFAULT_URL);
+        assert_eq!(config.cwd, config.workspace);
+        assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
+        assert_eq!(config.token.as_deref(), Some("secret"));
+        assert!(!config.keep_temp);
+    }
+
+    #[test]
+    fn engine_and_executable_allowlists_are_enforced() {
         for engine in KNOWN_ENGINES {
-            let exe = format!("{engine}.exe");
-            let config =
-                config_from(&exe, &[("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR"))]).unwrap();
-            assert_eq!(config.engine, engine);
+            assert_eq!(
+                validate_configured_engine(OsStr::new(&format!("{engine}.exe")), engine).unwrap(),
+                engine
+            );
+        }
+        for (exe, engine) in [
+            ("shell.exe", "latexmk"),
+            ("xelatex.exe", "pdflatex"),
+            ("tuntex-client.exe", "shell"),
+        ] {
+            assert!(validate_configured_engine(OsStr::new(exe), engine).is_err());
         }
     }
 
     #[test]
-    fn unknown_executable_name_is_an_error_not_a_guess() {
-        let error = config_from(
-            "tuntex-client.exe",
-            &[("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR"))],
-        )
-        .unwrap_err();
-        assert_eq!(error.exit_code(), 64);
-        assert!(error.message().contains("invalid client executable name"));
+    fn yaml_accepts_all_client_fields() {
+        let yaml = format!("{}cwd: '{}'\ntimeout_seconds: 45\nforward_env: [TEXINPUTS]\nmax_upload_size: 100000\nmax_file_count: 100\ndebug: true\n",base(),env!("CARGO_MANIFEST_DIR"));
+        let config = Config::from_file(OsStr::new("latexmk.exe"), file(&yaml)).unwrap();
+        assert_eq!(config.timeout_seconds, 45);
+        assert_eq!(config.forward_env, vec!["TEXINPUTS"]);
+        assert_eq!(config.max_upload_size, 100000);
+        assert_eq!(config.max_file_count, 100);
+        assert!(config.debug);
     }
 
     #[test]
-    fn workspace_defaults_to_current_directory() {
-        let config = config_from("latexmk.exe", &[]).unwrap();
-        assert_eq!(config.workspace, std::env::current_dir().unwrap());
+    fn invalid_yaml_and_obsolete_settings_are_rejected() {
+        for extra in [
+            "token: secret",
+            "keep_temp: true",
+            "typo: 1",
+            "timeout_seconds: nope",
+            "input_mode: arbitrary",
+        ] {
+            assert!(
+                serde_yaml::from_str::<ClientFileConfig>(&format!("{}{extra}\n", base())).is_err(),
+                "{extra}"
+            );
+        }
     }
 
     #[test]
-    fn relative_workspace_is_rejected() {
-        let error =
-            config_from("latexmk.exe", &[("TUNTEX_WORKSPACE", "relative/path")]).unwrap_err();
-        assert!(error.message().contains("absolute"));
+    fn zero_limits_and_invalid_paths_are_rejected() {
+        for extra in [
+            "timeout_seconds: 0",
+            "max_upload_size: 0",
+            "max_file_count: 0",
+            "cwd: relative",
+        ] {
+            assert!(
+                Config::from_file(
+                    OsStr::new("latexmk.exe"),
+                    file(&format!("{}{extra}\n", base()))
+                )
+                .is_err(),
+                "{extra}"
+            );
+        }
+        for workspace in [
+            None,
+            Some(PathBuf::from("relative")),
+            Some(PathBuf::from("Z:/not-a-directory")),
+        ] {
+            let mut config = file(&base());
+            config.workspace = workspace;
+            assert!(Config::from_file(OsStr::new("latexmk.exe"), config).is_err());
+        }
     }
 
     #[test]
-    fn nonexistent_workspace_is_rejected() {
-        let error = config_from(
-            "latexmk.exe",
-            &[("TUNTEX_WORKSPACE", "Z:\\definitely\\not\\here")],
-        )
-        .unwrap_err();
-        assert!(error.message().contains("existing directory"));
-    }
-
-    #[test]
-    fn cwd_defaults_to_the_workspace() {
-        let config = config_from(
-            "latexmk.exe",
-            &[("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR"))],
-        )
-        .unwrap();
-        assert_eq!(config.cwd, config.workspace);
-    }
-
-    #[test]
-    fn defaults_are_applied() {
-        let config = config_from(
-            "latexmk.exe",
-            &[("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR"))],
-        )
-        .unwrap();
-        assert_eq!(config.url, DEFAULT_URL);
-        assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
-        assert!(config.token.is_none());
-        assert!(!config.debug);
-        assert!(config.forward_env.is_empty());
-    }
-
-    #[test]
-    fn trailing_slash_is_stripped_from_the_url() {
-        let config = config_from(
-            "latexmk.exe",
-            &[
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-                ("TUNTEX_URL", "http://127.0.0.1:9999/"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(config.url, "http://127.0.0.1:9999");
-    }
-
-    #[test]
-    fn url_without_a_scheme_is_rejected() {
-        let error = config_from(
-            "latexmk.exe",
-            &[
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-                ("TUNTEX_URL", "127.0.0.1:38117"),
-            ],
-        )
-        .unwrap_err();
-        assert!(error.message().contains("http://"));
-    }
-
-    #[test]
-    fn zero_timeout_is_rejected() {
-        let error = config_from(
-            "latexmk.exe",
-            &[
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-                ("TUNTEX_TIMEOUT", "0"),
-            ],
-        )
-        .unwrap_err();
-        assert!(error.message().contains("greater than zero"));
-    }
-
-    #[test]
-    fn non_numeric_timeout_is_rejected() {
-        let error = config_from(
-            "latexmk.exe",
-            &[
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-                ("TUNTEX_TIMEOUT", "soon"),
-            ],
-        )
-        .unwrap_err();
-        assert!(error.message().contains("positive integer"));
-    }
-
-    #[test]
-    fn forward_env_list_accepts_commas_and_semicolons() {
-        let config = config_from(
-            "latexmk.exe",
-            &[
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-                (
-                    "TUNTEX_FORWARD_ENV",
-                    "TEXINPUTS, TEXMFHOME;SOURCE_DATE_EPOCH",
-                ),
-            ],
-        )
-        .unwrap();
+    fn socket_validation_is_strict() {
+        for socket in [
+            "",
+            "http://user:pass@localhost",
+            "http://localhost?secret=1",
+            "http://localhost#fragment",
+        ] {
+            let mut config = file(&base());
+            config.socket = socket.into();
+            assert!(Config::from_file(OsStr::new("latexmk.exe"), config).is_err());
+        }
+        let mut config = file(&base());
+        config.socket = "http://localhost:38117/".into();
         assert_eq!(
-            config.forward_env,
-            vec!["TEXINPUTS", "TEXMFHOME", "SOURCE_DATE_EPOCH"]
+            Config::from_file(OsStr::new("latexmk.exe"), config)
+                .unwrap()
+                .url,
+            "http://localhost:38117"
         );
     }
 
     #[test]
-    fn forwarding_a_system_variable_is_refused() {
-        let config = config_from(
-            "latexmk.exe",
-            &[
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-                ("TUNTEX_FORWARD_ENV", "TEXINPUTS,PATH"),
-            ],
-        )
-        .unwrap();
-        let error = config.collect_forwarded_env().unwrap_err();
-        assert!(error.message().contains("PATH"));
-    }
-
-    #[test]
-    fn unset_forwarded_variables_are_skipped() {
-        let config = config_from(
-            "latexmk.exe",
-            &[
-                ("TUNTEX_WORKSPACE", env!("CARGO_MANIFEST_DIR")),
-                ("TUNTEX_FORWARD_ENV", "TUNTEX_TEST_VARIABLE_THAT_IS_NOT_SET"),
-            ],
-        )
-        .unwrap();
-        assert!(config.collect_forwarded_env().unwrap().is_empty());
+    fn unsafe_engine_environment_variables_are_rejected() {
+        for name in ["PATH", "HOME", "LD_PRELOAD", "TMPDIR"] {
+            assert!(check_forwardable(name).is_err());
+        }
+        assert!(check_forwardable("TEXINPUTS").is_ok());
     }
 }

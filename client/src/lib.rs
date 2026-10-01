@@ -9,6 +9,7 @@
 
 pub mod archive;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod pathmap;
 pub mod protocol;
@@ -122,14 +123,15 @@ where
     let mut args = args.into_iter();
     let executable = args.next().unwrap_or_default();
     let latex_argv: Vec<OsString> = args.collect();
+    let metadata_only = is_engine_information_query(&latex_argv);
 
-    let config = Config::from_env(&executable)?;
+    let config = Config::from_invocation(&executable, &latex_argv, metadata_only)?;
     let log = DebugLog::new(config.debug);
 
     let mapper = PathMapper::new(&config.workspace)?;
     if !mapper.contains(&config.cwd) {
         return Err(Error::config(format!(
-            "TUNTEX_CWD is outside TUNTEX_WORKSPACE:\n  \
+            "cwd is outside workspace:\n  \
              cwd:       {}\n  \
              workspace: {}",
             config.cwd.display(),
@@ -153,7 +155,7 @@ where
     // From here on the caller may interrupt; make the remote job stoppable.
     signal::install_handler(config.url.clone(), config.token.clone(), request_id.clone())?;
 
-    let metadata = RequestMetadata::new(
+    let mut metadata = RequestMetadata::new(
         request_id.clone(),
         config.engine.clone(),
         remote_argv,
@@ -162,18 +164,87 @@ where
         config.timeout_seconds,
     );
 
-    let rules = archive::IgnoreRules::load(&config.workspace)?;
     let request_path = scratch.join("request.tar.gz");
-    let report = archive::create_request_archive(
-        &request_path,
-        &config.workspace,
-        &metadata.to_bytes()?,
-        &rules,
-        archive::Limits {
-            max_file_count: config.max_file_count,
-            max_upload_size: config.max_upload_size,
-        },
-    )?;
+    let remote = Remote::new(&config.url, config.token.clone(), config.timeout_seconds)?;
+    let mut all_sources = std::collections::BTreeSet::new();
+    let report = if metadata_only {
+        archive::create_metadata_only_archive(&request_path, &metadata.to_bytes()?)?
+    } else {
+        let temporary_entry = if config.input_mode == config::InputMode::Temporary {
+            latex_argv
+                .iter()
+                .find(|arg| {
+                    std::path::Path::new(arg)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
+                })
+                .map(|arg| std::env::current_dir().map(|cwd| cwd.join(arg)))
+                .transpose()
+                .map_err(|e| Error::config(e.to_string()))?
+        } else {
+            None
+        };
+        let paths = discovery::discover(
+            &config.workspace,
+            config.max_file_count,
+            temporary_entry.as_deref(),
+        )?;
+        let root = config
+            .workspace
+            .canonicalize()
+            .map_err(|e| Error::config(e.to_string()))?;
+        let mut indexed = std::collections::BTreeMap::new();
+        let mut total = 0u64;
+        for path in paths {
+            use sha2::{Digest, Sha256};
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| Error::config("dependency escapes workspace"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let size = fs::metadata(&path)
+                .map_err(|e| Error::config(e.to_string()))?
+                .len();
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| Error::config("source size overflow"))?;
+            if total > config.max_upload_size {
+                return Err(Error::config("source files exceed max_upload_size"));
+            }
+            let mut file = fs::File::open(&path).map_err(|e| Error::config(e.to_string()))?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest).map_err(|e| Error::config(e.to_string()))?;
+            metadata
+                .source_manifest
+                .insert(relative.clone(), format!("{:x}", digest.finalize()));
+            indexed.insert(relative, path);
+        }
+        all_sources = indexed.values().cloned().collect();
+        let selected = if config.token.is_some() {
+            remote
+                .missing_files(&metadata.source_manifest)?
+                .into_iter()
+                .map(|name| {
+                    indexed
+                        .get(&name)
+                        .cloned()
+                        .ok_or_else(|| Error::protocol("server requested an unknown source"))
+                })
+                .collect::<Result<std::collections::BTreeSet<_>>>()?
+        } else {
+            indexed.into_values().collect()
+        };
+        archive::create_selected_archive(
+            &request_path,
+            &config.workspace,
+            &metadata.to_bytes()?,
+            &selected,
+            archive::Limits {
+                max_file_count: config.max_file_count,
+                max_upload_size: config.max_upload_size,
+            },
+        )?
+    };
 
     log.line(&format!("files: {}", report.file_count));
     log.line(&format!(
@@ -181,14 +252,41 @@ where
         archive::human_size(report.total_bytes)
     ));
 
-    let remote = Remote::new(&config.url, config.token.clone(), config.timeout_seconds)?;
     let result_path = scratch.join("result.tar.gz");
-    let received = remote.compile(&request_path, &result_path, &request_id)?;
+    let received = match remote.compile(&request_path, &result_path, &request_id) {
+        Err(error) if !metadata_only && error.message().contains("retry synchronization") => {
+            log.line("source cache changed; retrying with the complete dependency set");
+            archive::create_selected_archive(
+                &request_path,
+                &config.workspace,
+                &metadata.to_bytes()?,
+                &all_sources,
+                archive::Limits {
+                    max_file_count: config.max_file_count,
+                    max_upload_size: config.max_upload_size,
+                },
+            )?;
+            remote.compile(&request_path, &result_path, &request_id)?
+        }
+        outcome => outcome?,
+    };
     log.line(&format!("result size: {}", archive::human_size(received)));
 
     let staging = scratch.join("staging");
-    let applied =
-        sync::apply_result_archive(&result_path, &staging, &config.workspace, &request_id)?;
+    let query_output = scratch.join("query-output");
+    if metadata_only {
+        fs::create_dir(&query_output).map_err(|e| Error::software(e.to_string()))?;
+    }
+    let applied = sync::apply_result_archive(
+        &result_path,
+        &staging,
+        if metadata_only {
+            &query_output
+        } else {
+            &config.workspace
+        },
+        &request_id,
+    )?;
 
     log.line(&format!("remote duration: {}ms", applied.duration_ms));
     log.line(&format!("changed files: {}", applied.changed_count));
@@ -207,6 +305,17 @@ where
     Ok(applied.exit_code)
 }
 
+fn is_engine_information_query(arguments: &[OsString]) -> bool {
+    matches!(
+        arguments,
+        [argument]
+            if matches!(
+                argument.to_str(),
+                Some("--version" | "-version" | "-v" | "--help" | "-help" | "-h")
+            )
+    )
+}
+
 fn write_stream(out: &mut impl Write, payload: &[u8]) -> Result<()> {
     if payload.is_empty() {
         return Ok(());
@@ -221,6 +330,18 @@ fn write_stream(out: &mut impl Write, payload: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_information_queries_do_not_need_a_workspace_upload() {
+        for argument in ["--version", "-version", "-v", "--help", "-help", "-h"] {
+            assert!(is_engine_information_query(&[OsString::from(argument)]));
+        }
+        assert!(!is_engine_information_query(&[]));
+        assert!(!is_engine_information_query(&[
+            OsString::from("--version"),
+            OsString::from("main.tex"),
+        ]));
+    }
 
     #[test]
     fn mapping_arguments_rewrites_only_paths() {

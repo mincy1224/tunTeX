@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// Wire-format version understood by this client.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Where the request metadata lives inside the request archive.
 pub const REQUEST_META_NAME: &str = "meta/request.json";
@@ -45,6 +45,8 @@ pub struct RequestMetadata {
     pub cwd: String,
     pub env: BTreeMap<String, String>,
     pub timeout_seconds: u64,
+    #[serde(default)]
+    pub source_manifest: BTreeMap<String, String>,
 }
 
 impl RequestMetadata {
@@ -64,6 +66,7 @@ impl RequestMetadata {
             cwd: cwd.into(),
             env,
             timeout_seconds,
+            source_manifest: BTreeMap::new(),
         }
     }
 

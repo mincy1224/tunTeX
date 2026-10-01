@@ -24,12 +24,13 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use tar::{Archive, Builder, EntryType, Header};
 use tokio::{io::AsyncWriteExt, sync::Semaphore};
 use uuid::Uuid;
 
-const PROTOCOL: u32 = 1;
+mod projects;
+
+const PROTOCOL: u32 = 2;
 const HEADER_PROTOCOL: &str = "x-tuntex-protocol";
 const HEADER_REQUEST_ID: &str = "x-tuntex-request-id";
 
@@ -38,7 +39,6 @@ const HEADER_REQUEST_ID: &str = "x-tuntex-request-id";
 struct ServerSection {
     host: IpAddr,
     port: u16,
-    token: String,
     max_request_size: u64,
     max_result_size: u64,
     max_file_size: u64,
@@ -46,7 +46,7 @@ struct ServerSection {
     max_concurrent_builds: usize,
     max_timeout_seconds: u64,
     work_root: Option<PathBuf>,
-    keep_temp: bool,
+    projects_root: Option<PathBuf>,
 }
 
 impl Default for ServerSection {
@@ -54,7 +54,6 @@ impl Default for ServerSection {
         Self {
             host: "127.0.0.1".parse().unwrap(),
             port: 38117,
-            token: String::new(),
             max_request_size: 512 * 1024 * 1024,
             max_result_size: 512 * 1024 * 1024,
             max_file_size: 256 * 1024 * 1024,
@@ -62,7 +61,7 @@ impl Default for ServerSection {
             max_concurrent_builds: 4,
             max_timeout_seconds: 600,
             work_root: None,
-            keep_temp: false,
+            projects_root: None,
         }
     }
 }
@@ -132,11 +131,17 @@ fn valid_engine_name(name: &str) -> bool {
     )
 }
 
+struct ActiveJob {
+    owner: String,
+    cancel: Arc<AtomicBool>,
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
     slots: Arc<Semaphore>,
-    jobs: Arc<Mutex<HashMap<Uuid, Arc<AtomicBool>>>>,
+    jobs: Arc<Mutex<HashMap<Uuid, ActiveJob>>>,
+    project_locks: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Debug)]
@@ -191,6 +196,8 @@ struct RequestMeta {
     #[serde(default)]
     env: BTreeMap<String, String>,
     timeout_seconds: u64,
+    #[serde(default)]
+    source_manifest: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -218,13 +225,37 @@ async fn main() {
         Some("start") => start_server(),
         Some("status") => server_status(),
         Some("stop") => stop_server(),
+        Some("project") => project_command(),
         Some(command) => Err(format!(
-            "unknown command {command:?}; expected start, status, stop, or run"
+            "unknown command {command:?}; expected start, status, stop, run, or project"
         )),
     };
     if let Err(error) = result {
         eprintln!("tuntex-server: {error}");
         std::process::exit(1);
+    }
+}
+
+fn projects_root(config: &Config) -> Result<PathBuf, String> {
+    config
+        .server
+        .projects_root
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| state_dir().map(|root| root.join("projects")))
+}
+
+fn project_command() -> Result<(), String> {
+    let config = Config::load()?;
+    let mut store = projects::Store::open(&projects_root(&config)?)?;
+    match env::args().nth(2).as_deref() {
+        Some("register") => {
+            println!("{}", store.register()?);
+            Ok(())
+        }
+        Some("list") => store.list(),
+        Some("delete") => store.delete(&env::args().nth(3).ok_or("project delete requires a key")?),
+        _ => Err("expected project register, list, or delete <key>".into()),
     }
 }
 
@@ -424,6 +455,7 @@ async fn serve() -> Result<(), String> {
     let state = AppState {
         slots: Arc::new(Semaphore::new(config.server.max_concurrent_builds)),
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        project_locks: Arc::new(Mutex::new(HashMap::new())),
         config,
     };
     let app = Router::new()
@@ -433,6 +465,7 @@ async fn serve() -> Result<(), String> {
         )
         .route("/info", get(info))
         .route("/compile", post(compile))
+        .route("/manifest", post(manifest))
         .route("/jobs/{id}", delete(cancel))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address)
@@ -466,24 +499,74 @@ async fn info(State(state): State<AppState>) -> Json<serde_json::Value> {
     )
 }
 
+async fn manifest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(manifest): Json<BTreeMap<String, String>>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    if headers.get(HEADER_PROTOCOL).and_then(|v| v.to_str().ok()) != Some("2") {
+        return Err(ApiError::bad("unsupported protocol"));
+    }
+    let key = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let key = key.to_owned();
+    let config = state.config.clone();
+    tokio::task::spawn_blocking(move || manifest_files(&config, &key, manifest))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map(Json)
+}
+
+fn manifest_files(
+    config: &Config,
+    key: &str,
+    manifest: BTreeMap<String, String>,
+) -> Result<Vec<String>, ApiError> {
+    let project = projects::Store::open(&projects_root(config).map_err(ApiError::internal)?)
+        .and_then(|store| store.workspace(&store.directory(key)?))
+        .map_err(|_| {
+            ApiError(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "invalid project key".into(),
+            )
+        })?;
+    if manifest.len() > config.server.max_file_count {
+        return Err(ApiError::too_large("manifest file count exceeds limit"));
+    }
+    let mut missing = Vec::new();
+    for (name, hash) in manifest {
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ApiError::invalid("invalid source hash"));
+        }
+        let path = project.join(clean_relative(&name)?);
+        let actual = hash_file(&path).ok();
+        if actual.as_deref() != Some(&hash) {
+            missing.push(name);
+        }
+    }
+    Ok(missing)
+}
+
 fn check_headers(headers: &HeaderMap, config: &Config) -> Result<Uuid, ApiError> {
-    if headers.get(HEADER_PROTOCOL).and_then(|v| v.to_str().ok()) != Some("1") {
+    if headers.get(HEADER_PROTOCOL).and_then(|v| v.to_str().ok()) != Some("2") {
         return Err(ApiError::bad(format!(
             "missing or unsupported {HEADER_PROTOCOL}"
         )));
     }
-    if !config.server.token.is_empty() {
+    {
         let supplied = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or("");
-        if supplied
-            .as_bytes()
-            .ct_eq(config.server.token.as_bytes())
-            .unwrap_u8()
-            != 1
-        {
+        let registered = projects::Store::open(&projects_root(config).map_err(ApiError::internal)?)
+            .and_then(|store| store.directory(supplied))
+            .is_ok();
+        if !registered {
             return Err(ApiError(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
@@ -513,16 +596,35 @@ async fn compile(
         return Err(ApiError::bad("Content-Type must be application/gzip"));
     }
     let cancel = Arc::new(AtomicBool::new(false));
+    let key = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string();
     {
         let mut jobs = state
             .jobs
             .lock()
             .map_err(|_| ApiError::internal("job registry poisoned"))?;
-        if jobs.insert(id, cancel.clone()).is_some() {
+        if jobs.contains_key(&id) {
             return Err(ApiError::bad("request id is already active"));
         }
+        jobs.insert(
+            id,
+            ActiveJob {
+                owner: key.clone(),
+                cancel: cancel.clone(),
+            },
+        );
     }
-    let result = compile_inner(state.clone(), id, cancel, body).await;
+    let key = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string();
+    let result = compile_inner(state.clone(), id, cancel, body, key).await;
     if let Ok(mut jobs) = state.jobs.lock() {
         jobs.remove(&id);
     }
@@ -537,7 +639,34 @@ async fn compile_inner(
     id: Uuid,
     cancel: Arc<AtomicBool>,
     body: Body,
+    project_key: String,
 ) -> Result<Response, ApiError> {
+    let project = if project_key.is_empty() {
+        None
+    } else {
+        Some(
+            projects::Store::open(&projects_root(&state.config).map_err(ApiError::internal)?)
+                .and_then(|store| store.directory(&project_key))
+                .map_err(ApiError::invalid)?,
+        )
+    };
+    let lock = if let Some(path) = &project {
+        Some(
+            state
+                .project_locks
+                .lock()
+                .map_err(|_| ApiError::internal("project lock poisoned"))?
+                .entry(path.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let _project_guard = match &lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let root = state
         .config
         .server
@@ -586,16 +715,21 @@ async fn compile_inner(
         .map_err(|_| ApiError::internal("server is shutting down"))?;
     let config = state.config.clone();
     let path = job.path().to_path_buf();
-    let archive =
-        tokio::task::spawn_blocking(move || run_job(&config, id, &path, &request_path, &cancel))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))??;
+    let archive = tokio::task::spawn_blocking(move || {
+        run_job(
+            &config,
+            id,
+            &path,
+            &request_path,
+            &cancel,
+            project.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
     let bytes = tokio::fs::read(archive)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    if state.config.server.keep_temp {
-        let _ = job.keep();
-    }
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/gzip")
@@ -619,14 +753,26 @@ async fn cancel(
         .jobs
         .lock()
         .map_err(|_| ApiError::internal("job registry poisoned"))?;
-    let flag = jobs.get(&id).ok_or_else(|| {
+    let job = jobs.get(&id).ok_or_else(|| {
         ApiError(
             StatusCode::NOT_FOUND,
             "job_not_found",
             "job is not active".into(),
         )
     })?;
-    flag.store(true, Ordering::Release);
+    let key = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if job.owner != key {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "job belongs to another project".into(),
+        ));
+    }
+    job.cancel.store(true, Ordering::Release);
     Ok(Json(serde_json::json!({"cancelled":true,"request_id":id})))
 }
 
@@ -636,11 +782,14 @@ fn run_job(
     job: &Path,
     request_archive: &Path,
     cancel: &AtomicBool,
+    project: Option<&Path>,
 ) -> Result<PathBuf, ApiError> {
     let workspace = job.join("workspace");
     fs::create_dir_all(&workspace).map_err(|e| ApiError::internal(e.to_string()))?;
-    extract_request(config, request_archive, job)?;
-    let metadata_path = job.join("meta/request.json");
+    let uploads = job.join("uploads");
+    fs::create_dir_all(&uploads).map_err(|e| ApiError::internal(e.to_string()))?;
+    extract_request(config, request_archive, &uploads)?;
+    let metadata_path = uploads.join("meta/request.json");
     let raw =
         fs::read(&metadata_path).map_err(|_| ApiError::invalid("missing meta/request.json"))?;
     if raw.len() > 1024 * 1024 {
@@ -649,6 +798,53 @@ fn run_job(
     let meta: RequestMeta = serde_json::from_slice(&raw)
         .map_err(|e| ApiError::invalid(format!("invalid request metadata: {e}")))?;
     validate_meta(config, id, &meta)?;
+    let information_query = meta.argv.len() == 1
+        && matches!(
+            meta.argv[0].as_str(),
+            "--version" | "-version" | "-v" | "--help" | "-help" | "-h"
+        );
+    let project = if information_query { None } else { project };
+    if let Some(project) = project {
+        let store = projects::Store::open(&projects_root(config).map_err(ApiError::internal)?)
+            .map_err(ApiError::internal)?;
+        let previous = store.workspace(project).map_err(ApiError::internal)?;
+        if previous.is_dir() {
+            copy_workspace(&previous, &workspace)?;
+        }
+        let uploaded = uploads.join("workspace");
+        if uploaded.is_dir() {
+            for name in snapshot(&uploaded)?.keys() {
+                if !meta.source_manifest.contains_key(name) {
+                    return Err(ApiError::invalid(
+                        "uploaded file is absent from source manifest",
+                    ));
+                }
+            }
+            copy_workspace(&uploaded, &workspace)?;
+        }
+        for name in store.sources(project).map_err(ApiError::internal)? {
+            if !meta.source_manifest.contains_key(&name) {
+                let path = workspace.join(clean_relative(&name)?);
+                if path.is_file() {
+                    fs::remove_file(path).map_err(|e| ApiError::internal(e.to_string()))?;
+                }
+            }
+        }
+        for (name, hash) in &meta.source_manifest {
+            let path = workspace.join(clean_relative(name)?);
+            let actual = hash_file(&path).map_err(|_| {
+                ApiError::invalid(format!("missing source {name:?}; retry synchronization"))
+            })?;
+            if actual != *hash {
+                return Err(ApiError::invalid(format!(
+                    "source hash mismatch for {name:?}; retry synchronization"
+                )));
+            }
+        }
+    }
+    if project.is_none() && uploads.join("workspace").is_dir() {
+        copy_workspace(&uploads.join("workspace"), &workspace)?;
+    }
     let cwd = virtual_path(&workspace, &meta.cwd)?;
     if !cwd.is_dir() {
         return Err(ApiError::invalid("cwd is not a directory"));
@@ -739,7 +935,9 @@ fn run_job(
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
     for (path, stamp) in &after {
-        if before.get(path) != Some(stamp) {
+        if before.get(path) != Some(stamp)
+            || (project.is_some() && !meta.source_manifest.contains_key(path))
+        {
             changed.push(path.clone());
         }
     }
@@ -768,7 +966,53 @@ fn run_job(
         &stderr,
         &changed,
     )?;
+    if let Some(project) = project {
+        fs::create_dir_all(project).map_err(|e| ApiError::internal(e.to_string()))?;
+        let mut store = projects::Store::open(&projects_root(config).map_err(ApiError::internal)?)
+            .map_err(ApiError::internal)?;
+        let previous = store.workspace(project).map_err(ApiError::internal)?;
+        let generation = Uuid::new_v4().to_string();
+        let destination = project.join("generations").join(&generation);
+        copy_workspace(&workspace, &destination)?;
+        if let Err(error) = store.save_sources(project, &meta.source_manifest, &generation) {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(ApiError::invalid(error));
+        }
+        if previous.is_dir() {
+            let _ = fs::remove_dir_all(previous);
+        }
+    }
     Ok(result_path)
+}
+
+fn copy_workspace(source: &Path, destination: &Path) -> Result<(), ApiError> {
+    fs::create_dir_all(destination).map_err(|e| ApiError::internal(e.to_string()))?;
+    for entry in fs::read_dir(source).map_err(|e| ApiError::internal(e.to_string()))? {
+        let entry = entry.map_err(|e| ApiError::internal(e.to_string()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        if kind.is_symlink() {
+            return Err(ApiError::invalid("workspace links are forbidden"));
+        }
+        let target = destination.join(entry.file_name());
+        if kind.is_dir() {
+            copy_workspace(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &target).map_err(|e| ApiError::internal(e.to_string()))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            if let Ok(modified) = metadata.modified() {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&target)
+                    .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(modified)))
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn prepare_output_directories(
@@ -827,6 +1071,17 @@ fn prepare_output_directories(
 fn validate_meta(config: &Config, id: Uuid, meta: &RequestMeta) -> Result<(), ApiError> {
     if meta.protocol != PROTOCOL || meta.request_id != id {
         return Err(ApiError::invalid("protocol or request id mismatch"));
+    }
+    if meta.source_manifest.len() > config.server.max_file_count {
+        return Err(ApiError::too_large(
+            "source manifest exceeds max_file_count",
+        ));
+    }
+    for (path, hash) in &meta.source_manifest {
+        clean_relative(path)?;
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ApiError::invalid("invalid source hash"));
+        }
     }
     if !valid_engine_name(&meta.engine) || !config.engines.contains_key(&meta.engine) {
         return Err(ApiError::invalid("engine is not allowed"));
@@ -1056,6 +1311,13 @@ fn snapshot(root: &Path) -> Result<BTreeMap<String, FileStamp>, ApiError> {
     Ok(result)
 }
 
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file, &mut hash)?;
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 fn append_bytes<W: Write>(
     builder: &mut Builder<W>,
     name: &str,
@@ -1224,6 +1486,31 @@ mod tests {
     }
 
     #[test]
+    fn workspace_copies_preserve_modification_times() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::create_dir(&source).unwrap();
+        let path = source.join("main.tex");
+        fs::write(&path, b"source").unwrap();
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        copy_workspace(&source, &target).unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().modified().unwrap(),
+            fs::metadata(target.join("main.tex"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn yaml_rejects_unknown_server_keys() {
         let raw = "server:\n  typo: true\nengines:\n  latexmk:\n    command: latexmk\n";
         assert!(serde_yaml::from_str::<Config>(raw).is_err());
@@ -1234,5 +1521,62 @@ mod tests {
         let raw = "engines:\n  shell:\n    command: cmd\n";
         let config: Config = serde_yaml::from_str(raw).unwrap();
         assert!(config.validate().is_err());
+    }
+}
+#[test]
+fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("projects");
+    let mut config: Config =
+        serde_yaml::from_str("engines:\n  xelatex:\n    command: xelatex\n").unwrap();
+    config.server.projects_root = Some(registry.clone());
+    let engine = config.engines.get_mut("xelatex").unwrap();
+    #[cfg(windows)]
+    {
+        engine.command = "cmd.exe".into();
+        engine.args = vec!["/C".into(), "echo product>main.pdf".into()];
+    }
+    #[cfg(not(windows))]
+    {
+        engine.command = "sh".into();
+        engine.args = vec!["-c".into(), "printf product >main.pdf".into()];
+    }
+    let store = projects::Store::open(&registry).unwrap();
+    let key = store.register().unwrap();
+    let project = store.directory(&key).unwrap();
+    let manifest = BTreeMap::from([(
+        "main.tex".to_string(),
+        format!("{:x}", Sha256::digest(b"source")),
+    )]);
+    for (index, query) in [false, false, true].into_iter().enumerate() {
+        let job = root.path().join(format!("job-{index}"));
+        fs::create_dir(&job).unwrap();
+        let id = Uuid::new_v4();
+        let archive = job.join("request.tar.gz");
+        let metadata = serde_json::json!({"protocol":PROTOCOL,"request_id":id,"engine":"xelatex","argv":if query {vec!["--version"]} else {vec!["main.tex"]},"cwd":"/workspace","env":{},"timeout_seconds":10,"source_manifest":if query { BTreeMap::new() } else {manifest.clone()}});
+        let encoder = GzEncoder::new(fs::File::create(&archive).unwrap(), Compression::default());
+        let mut builder = Builder::new(encoder);
+        append_bytes(
+            &mut builder,
+            "meta/request.json",
+            &serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        if index == 0 {
+            append_bytes(&mut builder, "workspace/main.tex", b"source").unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        run_job(
+            &config,
+            id,
+            &job,
+            &archive,
+            &AtomicBool::new(false),
+            Some(&project),
+        )
+        .unwrap();
+        let persistent = store.workspace(&project).unwrap();
+        assert_eq!(fs::read(persistent.join("main.tex")).unwrap(), b"source");
+        assert!(persistent.join("main.pdf").is_file());
     }
 }

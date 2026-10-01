@@ -81,6 +81,25 @@ impl Remote {
     }
 
     /// `POST /compile`, streaming `archive_path` up and the result down.
+    pub fn missing_files(
+        &self,
+        manifest: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<String>> {
+        let response = self
+            .decorate(
+                self.client.post(self.endpoint("/manifest")).json(manifest),
+                None,
+            )
+            .send()
+            .map_err(|error| self.connection_error(error))?;
+        if !response.status().is_success() {
+            return Err(self.describe_http_failure(response.status(), response));
+        }
+        response
+            .json()
+            .map_err(|error| Error::protocol(format!("invalid manifest response: {error}")))
+    }
+
     ///
     /// Returns the byte length of the result written to `result_path`.
     pub fn compile(
@@ -193,7 +212,7 @@ impl Remote {
         match status.as_u16() {
             401 | 403 => Error::auth(format!(
                 "{message}\n\
-                 check TUNTEX_TOKEN matches the server's configured token"
+                 check project_key is registered on the server"
             )),
             413 => Error::config(format!(
                 "{message}\n\
@@ -217,7 +236,7 @@ impl Remote {
         }
         Error::unavailable(format!(
             "cannot connect to {}\n\
-             check that the remote service is running and that TUNTEX_URL is correct",
+             check that the remote service is running and that socket is correct",
             self.base_url
         ))
         .with_source(error)

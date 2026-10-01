@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 # Blocking HTTP only: no async runtime, so the binary stays a single exe with no
 # extra runtime dependencies.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -27,4 +27,5 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 ctrlc = "3"
 sha2 = "0.10"
+regex = "1"
 

@@ -1,12 +1,4 @@
-//! Building the request archive, and the path rules shared with extraction.
-//!
-//! The whole workspace is uploaded, not just the entry `.tex` file: `\input`
-//! chains, figures, custom `.sty`/`.cls`, and the previous run's `.aux`/`.fls`
-//! files all have to be there for `latexmk` to build incrementally.
-//!
-//! What is *not* uploaded by default is the version-control metadata.  Note
-//! that build products are deliberately kept -- a `.gitignore` is a poor
-//! upload filter for exactly this reason.
+//! Request archives and safe member paths. Production uploads selected dependencies.
 
 use std::fs::File;
 use std::io::Write;
@@ -352,14 +344,14 @@ fn walk_workspace(workspace: &Path, rules: &IgnoreRules, limits: Limits) -> Resu
             if total_bytes > limits.max_upload_size {
                 return Err(Error::config(format!(
                     "upload exceeds the configured {} limit (already {total_bytes} bytes at {relative})\n\
-                     raise TUNTEX_MAX_UPLOAD_SIZE, or exclude files with {IGNORE_FILE_NAME}",
+                     increase max_upload_size, narrow workspace, or exclude files with {IGNORE_FILE_NAME}",
                     human_size(limits.max_upload_size)
                 )));
             }
             if entries.len() + 1 > limits.max_file_count {
                 return Err(Error::config(format!(
                     "workspace contains more than the configured {} files\n\
-                     raise TUNTEX_MAX_FILE_COUNT, or exclude files with {IGNORE_FILE_NAME}",
+                     increase max_file_count, narrow workspace, or exclude files with {IGNORE_FILE_NAME}",
                     limits.max_file_count
                 )));
             }
@@ -385,7 +377,61 @@ pub fn create_request_archive(
     limits: Limits,
 ) -> Result<ArchiveReport> {
     let entries = walk_workspace(workspace, rules, limits)?;
+    create_archive(destination, metadata_bytes, &entries)
+}
 
+/// Write a request containing metadata only, for engine information queries.
+pub fn create_metadata_only_archive(
+    destination: &Path,
+    metadata_bytes: &[u8],
+) -> Result<ArchiveReport> {
+    create_archive(destination, metadata_bytes, &[])
+}
+
+pub fn create_selected_archive(
+    destination: &Path,
+    workspace: &Path,
+    metadata_bytes: &[u8],
+    paths: &std::collections::BTreeSet<std::path::PathBuf>,
+    limits: Limits,
+) -> Result<ArchiveReport> {
+    let root = workspace.canonicalize().map_err(io_error)?;
+    let mut entries = Vec::new();
+    let mut total = 0u64;
+    for path in paths {
+        let resolved = path.canonicalize().map_err(io_error)?;
+        if !resolved.starts_with(&root) {
+            return Err(Error::config("selected file escapes workspace"));
+        }
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| Error::config("selected file escapes workspace"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        validate_member_name(&relative)?;
+        let size = path.metadata().map_err(io_error)?.len();
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| Error::config("upload size overflow"))?;
+        if total > limits.max_upload_size || entries.len() >= limits.max_file_count {
+            return Err(Error::config(
+                "selected files exceed max_upload_size or max_file_count",
+            ));
+        }
+        entries.push(Entry {
+            absolute: path.clone(),
+            relative,
+            size,
+        });
+    }
+    create_archive(destination, metadata_bytes, &entries)
+}
+
+fn create_archive(
+    destination: &Path,
+    metadata_bytes: &[u8],
+    entries: &[Entry],
+) -> Result<ArchiveReport> {
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             Error::software(format!(
@@ -408,7 +454,7 @@ pub fn create_request_archive(
     append_bytes(&mut builder, protocol::REQUEST_META_NAME, metadata_bytes)?;
 
     let mut total_bytes = 0u64;
-    for entry in &entries {
+    for entry in entries {
         append_file(&mut builder, entry)?;
         total_bytes += entry.size;
     }
@@ -823,7 +869,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.exit_code(), 64);
-        assert!(error.message().contains("TUNTEX_MAX_FILE_COUNT"));
+        assert!(error.message().contains("max_file_count"));
     }
 
     #[test]
@@ -841,7 +887,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.message().contains("TUNTEX_MAX_UPLOAD_SIZE"));
+        assert!(error.message().contains("max_upload_size"));
     }
 
     #[test]
