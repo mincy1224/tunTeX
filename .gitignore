@@ -7,6 +7,11 @@
 /tun-tex-cfg.yaml
 /client/tun-tex-cfg.yaml
 /server/tuntex-server.yaml
+/tuntex-server.yaml
+**/tun-tex-cfg.yaml
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 /.env
 /.env.*
 

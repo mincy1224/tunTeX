@@ -1,144 +1,100 @@
 # tunTeX
 
-[English README](README.md)
+[English](README.md)
 
-tunTeX 是一个使用 Rust 编写的远程 LaTeX 编译代理。编辑器或构建工具调用本地客户端，客户端上传工作区，服务端运行真正的 TeX 引擎，再将生成文件、标准输出、标准错误和退出码同步回本地。
+Rust 编写的远程 LaTeX 代理。编辑器调用本地 EXE，服务端运行真实引擎，传回生成文件、标准输出、标准错误及退出码。仅服务端需要 TeX Live。
 
-客户端和服务端都是独立的原生可执行文件，不依赖 Python。
+## 构建与升级
 
-## 工作方式
-
-```text
-编辑器 / 命令行
-    │  xelatex main.tex
-    ▼
-tuntex-client
-    │  HTTP + tar.gz
-    ▼
-tuntex-server
-    │  xelatex main.tex
-    ▼
-PDF、日志、输出和退出码返回客户端
-```
-
-## 特性
-
-- 保留 LaTeX 参数、输出流和退出码。
-- 支持 `latexmk`、`xelatex`、`pdflatex`、`lualatex`、`bibtex`、`biber` 和 `makeindex`。
-- 支持 Windows 和 Linux 上的超时及取消，并终止完整的进程树。
-- 限制请求大小、展开后大小、单文件大小、文件数量、并发数和编译超时。
-- 拒绝路径穿越、归档链接、特殊文件、危险环境变量和未知引擎。
-- 完整校验结果归档后，再原子更新本地文件。
-- 支持 Bearer Token 认证和显式取消任务。
-
-## 构建
-
-需要稳定版 Rust 工具链：
-
-```bash
+```sh
 cargo build --release --bin tuntex-client
 cargo build --release --bin tuntex-server
 ```
 
-生成文件位于：
+产物位于 target/release。客户端安装在桌面端，服务端安装在提供 TeX Live 的环境中。
 
-```text
-target/release/tuntex-client[.exe]
-target/release/tuntex-server[.exe]
-```
+## 服务端
 
-## 客户端配置
+将 server/tuntex-server.example.yaml 复制为工作目录下的 tuntex-server.yaml，并配置引擎路径。TUNTEX_CONFIG 可指定其他服务端配置路径。
 
-客户端要求可执行文件同目录存在 `tun-tex-cfg.yaml`。可以复制示例配置：
-
-```powershell
-Copy-Item client/tun-tex-cfg.example.yaml target/release/tun-tex-cfg.yaml
-```
-
-Linux：
-
-```bash
-cp client/tun-tex-cfg.example.yaml target/release/tun-tex-cfg.yaml
-```
-
-配置示例：
-
-```yaml
-socket: 127.0.0.1:xxxxx
-tex: xelatex
-workspace: null
-cwd: null
-token: ""
-timeout_seconds: 120
-forward_env: []
-max_upload_size: 536870912
-max_file_count: 50000
-debug: false
-keep_temp: false
-```
-
-- `socket` 支持 `host:port`、`http://host:port` 和 `https://host:port`。
-- `tex` 必须是支持的引擎名称。
-- `workspace` 和 `cwd` 为 `null` 时使用当前工作目录。
-- `forward_env` 只列出允许透传给远端 TeX 进程的环境变量名称，不是 tunTeX 自身配置方式。
-- 配置文件缺失、存在未知字段、YAML 无效或引擎不支持时，程序会在读取工作区和访问网络前立即退出。
-
-客户端可以像普通 LaTeX 引擎一样调用：
-
-```powershell
-./tuntex-client.exe -interaction=nonstopmode main.tex
-```
-
-也可以将可执行文件命名为标准引擎名称，例如 `xelatex.exe`，以便编辑器无感调用。此时文件名必须与配置中的 `tex` 一致。不同引擎应放在不同目录，并分别放置自己的 `tun-tex-cfg.yaml`。
-
-将 `.tuntexignore` 放在工作区根目录可以排除上传文件；版本控制目录默认排除。
-
-## 服务端配置
-
-复制服务端示例配置：
-
-```powershell
-Copy-Item server/tuntex-server.example.yaml tuntex-server.yaml
-```
-
-根据服务端安装的 TeX 发行版配置 `engines`。服务端默认从当前目录读取 `tuntex-server.yaml`。也可以使用 `TUNTEX_CONFIG` 指定另一个服务端配置文件路径。
-
-后台启动并管理服务端：
-
-```bash
+```sh
+tuntex-server project register
+tuntex-server project list
+tuntex-server project delete <key>
 tuntex-server start
 tuntex-server status
 tuntex-server stop
 ```
 
-`run` 用于前台运行。Linux 的后台状态和日志保存在 `~/.local/state/tuntex`，Windows 则保存在 `%LOCALAPPDATA%\tuntex`。
+注册返回随机 key；列表按注册顺序显示 ID、Unix 时间戳和 key；删除撤销 key 并删除存储。列表包含凭据，请勿公开。
 
-服务端只会执行同时满足以下条件的引擎：已在 YAML 中声明，并且属于内置允许列表。客户端不能选择任意可执行文件。
+默认监听 127.0.0.1:38117。无子命令或 run 为前台运行。Linux 后台日志位于 ~/.local/state/tuntex/server.log，Windows 位于 %LOCALAPPDATA%/tuntex/server.log。
 
-## 编辑器集成
+server.projects_root 指定 SQLite 注册表与项目存储目录；null 使用平台状态目录下的 projects。每个 key 对应独立持久工作区，同项目串行，不同项目按 max_concurrent_builds 并发。源文件清单与工作区版本指针通过 SQLite 事务一起发布。请求临时目录自动清理，编译产物保留给后续 latexmk、BibTeX、Biber。
 
-将编辑器的 LaTeX 工具命令设置为 `tuntex-client.exe` 的绝对路径，并传入真实引擎所需的相同参数。例如 LaTeX Workshop 可以将客户端路径设置为 `command`，继续使用 `%DOC%` 和普通编译参数。
+## 客户端实例
 
-当编辑器从项目目录外启动客户端时，将 `workspace` 和 `cwd` 写入 `tun-tex-cfg.yaml`。
+一个 EXE 与同目录的 tun-tex-cfg.yaml 构成一个实例。客户端自身配置只用 YAML，不接受 tunTeX 环境变量覆盖。
 
-## 安全说明
+```yaml
+socket: 127.0.0.1:38117
+tex: latexmk
+project_key: '注册命令返回的KEY'
+input_mode: project
+workspace: 'E:/Documents/paper'
+cwd: null
+timeout_seconds: 120
+forward_env: []
+max_upload_size: 536870912
+max_file_count: 50000
+debug: false
+```
 
-服务端默认监听 `127.0.0.1`。跨主机使用时，请配置足够长的随机 Token，使用可信网络或启用 TLS 的反向代理，限制防火墙来源地址，并使用低权限专用账户运行服务端。
+项目模式必须配置存在的绝对 workspace。cwd 为 null 表示项目根目录；指定值必须位于工作区内。不会退回调用程序当前目录，拒绝磁盘根目录与 Windows 系统目录。
 
-LaTeX 文档可能执行外部程序或消耗大量资源。tunTeX 会校验传输协议和文件路径，但不是 TeX 沙箱，不应暴露给不受信任的用户。
+支持 latexmk、xelatex、pdflatex、lualatex、bibtex、biber、makeindex。EXE 可叫 tuntex-client.exe 或与 tex 完全一致，例如 pdflatex.exe。不同项目或引擎分开放在不同实例目录；其他名字被拒绝。
 
-## 开发与验证
+socket 接受 host:port 或 HTTP(S) URL。未知字段会报错。forward_env 只透传明确允许的引擎环境变量，不是 tunTeX 配置。旧 token、keep_temp 字段移除。
 
-```bash
+## 文件选择
+
+项目模式纳入所有 .tex，再收集 input、include、subfile、includegraphics、bibliography、addbibresource、bibliographystyle、documentclass、usepackage、lstinputlisting、VerbatimInput 中的静态引用。请使用花括号文件名与正斜杠。本地 .sty/.cls 继续扫描，支持常见图片扩展名与静态 graphicspath。系统宏包、文档类、样式由服务端 TeX 提供。
+
+引用的 .bib 与本地 .bst 会上传，生成的辅助文件保留在服务端。推荐 latexmk 处理多轮编译与参考文献。
+
+无关 EXE、未引用图片/PDF、本地构建产物不会上传。跳过版本控制目录和符号链接；.tuntexignore 过滤源文件发现。SHA-256 协商后只传新增或变化文件。并发使缓存变化时最多重试一次，补传完整依赖集合。
+
+不支持动态文件访问：不要用宏、变量、外部命令或运行时计算生成文件名。自定义加载命令、不带花括号输入、工作区外资源也不支持。静态扫描不是完整 TeX 解释器，不会兜底上传整个目录。文本源文件须为 UTF-8，单个不超过 16 MiB。本地 latexmk 配置、自定义字体和不支持命令加载的文件不会自动纳入。支持 includepdf/includesvg 引用。
+
+单参数 --version、-version、-v、--help、-help、-h 查询远程引擎，不扫描、不上传工作区文件；查询产物在本地丢弃。
+
+## VS Code 与 Inkscape
+
+LaTeX Workshop 的 command 指定实例 EXE 绝对路径，保留正常引擎参数与 %DOC%，YAML 配置项目绝对 workspace。
+
+生成临时 .tex 的应用使用单独实例：
+
+```yaml
+socket: 127.0.0.1:38117
+tex: pdflatex
+project_key: '单独注册的KEY'
+input_mode: temporary
+```
+
+EXE 叫 pdflatex.exe，在应用中指定路径，或将实例目录加入 PATH。临时模式要求恰好一个 .tex 输入，只选择它与静态依赖，不递归扫描共享临时目录。输入文件父目录作为工作区和远程 cwd；资源必须位于其中。
+
+查询仍需有效 YAML 与 key，但无需输入文件。部分 Inkscape 扩展需要额外工具或特定发现机制，不能保证所有扩展兼容。支持范围内 Windows 无需 TeX Live。
+
+## 安全与验证
+
+key 隔离存储，不隔离 TeX 对宿主机的访问。只运行可信文档，使用低权限账户。保持本地监听；跨主机需 TLS、防火墙和可信网络。不要提交包含 key 的配置。
+
+服务端存储持久存在，请监控磁盘并删除不用的项目。不可信文档需要额外操作系统级隔离。
+
+```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 ```
 
-测试覆盖客户端配置、路径映射、归档安全、HTTP 协议、文件同步、认证、超时、取消以及服务端配置校验。
-
-协议细节参见 [protocol.md](protocol.md)。
-
-## 许可证
-
-本项目使用 [MIT License](LICENSE)。
+协议见 [protocol.md](protocol.md)，许可证为 [MIT](LICENSE)。

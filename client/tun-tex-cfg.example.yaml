@@ -1,12 +1,12 @@
 socket: 127.0.0.1:38117
 tex: xelatex
-workspace: null
+input_mode: project
+workspace: 'E:/Documents/latex-project'
 cwd: null
-token: ""
+project_key: 'REPLACE_WITH_REGISTERED_KEY'
 timeout_seconds: 120
 forward_env: []
 max_upload_size: 536870912
 max_file_count: 50000
 debug: false
-keep_temp: false
 
