@@ -64,15 +64,15 @@ Socket accepts host:port or an HTTP(S) URL. Unknown YAML fields are errors. forw
 
 ## File selection
 
-Project mode includes all local `.tex`, `.sty`, `.cls`, `.clo`, `.def`, `.cfg`, `.ltx`, `.fd`, `.bbx`, `.cbx`, `.lbx`, `.bib`, and `.bst` files below the workspace, subject to ignore rules and upload limits. These files do not need explicit references to be uploaded. TeX support files are scanned recursively for literal resources referenced by input, include, subfile, includegraphics, bibliography, addbibresource, bibliographystyle, documentclass, usepackage, lstinputlisting, and VerbatimInput. Use braced filenames and forward slashes. Common image extensions and literal graphicspath entries are supported. Unreferenced images, PDFs, and unrelated files are not selected. Missing system packages/classes/styles are supplied by server TeX.
+Project mode recursively collects files by extension, without parsing their contents: `.tex`, `.sty`, `.cls`, `.clo`, `.def`, `.cfg`, `.ltx`, `.fd`, `.bbx`, `.cbx`, `.lbx`, `.bib`, `.bst`, `.png`, `.jpg`, `.jpeg`, `.pdf`, `.eps`, `.ps`, `.svg`, `.mps`, `.csv`, `.tsv`, `.dat`, `.txt`, `.tikz`, `.pgf`, `.otf`, `.ttf`, and `.ttc`. Files need not be explicitly referenced. Ignore rules and upload limits still apply. System packages are supplied by server TeX.
 
-Referenced .bib and local .bst files are included. Generated auxiliary files stay on the server. Prefer latexmk to orchestrate bibliography tools and multiple passes.
+Bibliography databases and styles are included. Generated auxiliary files stay on the server. Prefer latexmk to orchestrate bibliography tools and multiple passes.
 
 Before each compile, source additions, edits, and deletions are synchronized. Changed sources receive fresh modification times; unchanged sources keep theirs. Source changes automatically trigger a latexmk rebuild so stale failure records cannot suppress recompilation. Unchanged requests retain incremental behavior, and explicit cleaning commands are preserved.
 
-Unreferenced PDFs/images, executables, local build products, and unrelated files are not uploaded. Version-control directories and symlinks are skipped. .tuntexignore filters source discovery. SHA-256 negotiation uploads only missing or changed selected files. If another call changes the cache, the client retries once with the complete selected dependency set.
+The current output PDF is excluded using the input filename, job name, output directory, and latexmk `-cd` option. Intermediate products such as `.aux`, `.log`, `.fls`, `.fdb_latexmk`, and `.synctex.gz` are not in the extension allowlist. Ignore older outputs from other build commands with `.tuntexignore` if needed. Executables, version-control directories, and symlinks are excluded. SHA-256 negotiation uploads only missing or changed selected files; a synchronization conflict triggers at most one full selected-file retry.
 
-Dynamic file access is unsupported: do not construct filenames using macros, variables, external programs, or runtime computation. Custom loading commands, unbraced inputs, and resources outside the workspace are unsupported. Static scanning is not a full TeX interpreter; there is no fallback that uploads the entire directory. Text sources must be UTF-8 and at most 16 MiB each. Local latexmk configuration, custom fonts, and files loaded through unsupported commands are not automatically included. PDF/SVG inclusions through includepdf/includesvg are supported.
+Macro-generated filenames and custom loading commands are not rejected by discovery. Their resources must already exist inside the selected workspace and use an allowed extension. Workspace-external resources and local latexmk configuration are not uploaded. Font files are uploaded, but the engine must reference them as project files; installed font names are resolved on the server. No source encoding or content-parsing restriction is imposed by discovery.
 
 Single-argument --version, -version, -v, --help, -help, and -h calls query the remote engine without scanning/uploading workspace files. Query artifacts are discarded locally.
 
@@ -89,7 +89,7 @@ project_key: 'A_SEPARATE_REGISTERED_KEY'
 input_mode: temporary
 ```
 
-Name the executable pdflatex.exe and configure the application engine path, or add that instance directory to PATH. Temporary mode requires exactly one .tex argument. Only that entry and its static dependencies are selected; the shared temp directory is never recursively scanned. Its parent becomes the workspace and remote cwd. Resources must stay inside it.
+Name the executable pdflatex.exe and configure the application engine path, or add that instance directory to PATH. Temporary mode requires exactly one .tex argument. Its parent becomes the workspace and remote cwd. Allowed files directly in that directory are selected; subdirectories and the shared temp tree are not recursively scanned. Use project mode for nested resources.
 
 Queries still require a valid instance YAML and key, but no input file. Individual Inkscape extensions may need additional tools or discovery mechanisms; compatibility with every extension is not guaranteed. Windows needs no TeX Live for supported calls.
 

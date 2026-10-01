@@ -188,6 +188,15 @@ where
             &config.workspace,
             config.max_file_count,
             temporary_entry.as_deref(),
+            &discovery::output_files(
+                &config
+                    .workspace
+                    .canonicalize()
+                    .map_err(|e| Error::config(e.to_string()))?,
+                &metadata.cwd,
+                &config.engine,
+                &metadata.argv,
+            ),
         )?;
         let root = config
             .workspace

@@ -27,5 +27,4 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 ctrlc = "3"
 sha2 = "0.10"
-regex = "1"
 
