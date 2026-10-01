@@ -26,7 +26,7 @@ tuntex-server status
 tuntex-server stop
 ```
 
-Register prints a random project key. List prints IDs, Unix registration timestamps, and keys in registration order. Delete revokes the key and removes its stored workspace. List output contains credentials; keep it private.
+Register prints a random project key. List displays a table of project IDs, readable UTC registration times, and keys in registration order. Project IDs identify server storage; project keys belong in the client's project_key field. Delete revokes the key and removes its stored workspace. List output contains credentials; keep it private.
 
 The default listener is 127.0.0.1:38117. Run without a subcommand, or use run, for foreground operation. Background logs are in ~/.local/state/tuntex/server.log on Linux and %LOCALAPPDATA%/tuntex/server.log on Windows.
 

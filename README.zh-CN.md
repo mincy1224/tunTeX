@@ -26,7 +26,7 @@ tuntex-server status
 tuntex-server stop
 ```
 
-注册返回随机 key；列表按注册顺序显示 ID、Unix 时间戳和 key；删除撤销 key 并删除存储。列表包含凭据，请勿公开。
+注册返回随机 key；列表用表格按注册顺序显示项目 ID、可读的 UTC 注册时间和 key。项目 ID 标识服务端存储，key 填入客户端的 project_key。删除撤销 key 并删除存储。列表包含凭据，请勿公开。
 
 默认监听 127.0.0.1:38117。无子命令或 run 为前台运行。Linux 后台日志位于 ~/.local/state/tuntex/server.log，Windows 位于 %LOCALAPPDATA%/tuntex/server.log。
 

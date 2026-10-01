@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct Store {
@@ -46,23 +47,43 @@ impl Store {
     }
 
     pub fn list(&self) -> Result<(), String> {
+        self.write_list(&mut std::io::stdout().lock())
+    }
+
+    fn write_list(&self, output: &mut impl Write) -> Result<(), String> {
         let mut query = self
             .db
-            .prepare("SELECT id,key,created FROM projects ORDER BY created,rowid")
+            .prepare(
+                "SELECT id,key,datetime(created,'unixepoch') FROM projects ORDER BY created,rowid",
+            )
             .map_err(|e| e.to_string())?;
         let rows = query
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(2)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
+        let border = format!(
+            "+-{}-+-{}-+-{}-+",
+            "-".repeat(36),
+            "-".repeat(19),
+            "-".repeat(64)
+        );
+        writeln!(
+            output,
+            "{border}\n| {:<36} | {:<19} | {:<64} |\n{border}",
+            "PROJECT ID", "REGISTERED (UTC)", "PROJECT KEY"
+        )
+        .map_err(|e| e.to_string())?;
         for row in rows {
             let (id, key, created) = row.map_err(|e| e.to_string())?;
-            println!("{id}\t{created}\t{key}");
+            writeln!(output, "| {id:<36} | {created:<19} | {key:<64} |")
+                .map_err(|e| e.to_string())?;
         }
+        writeln!(output, "{border}").map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -200,4 +221,25 @@ mod tests {
         assert!(store.save_sources(&directory, &sources, "second").is_err());
         assert!(store.directory(&other).is_ok());
     }
+}
+#[test]
+fn list_has_headers_readable_utc_dates_and_registration_order() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path()).unwrap();
+    store
+        .db
+        .execute(
+            "INSERT INTO projects VALUES ('first','key-one',0),('second','key-two',1)",
+            [],
+        )
+        .unwrap();
+    let mut output = Vec::new();
+    store.write_list(&mut output).unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("PROJECT ID"));
+    assert!(output.contains("REGISTERED (UTC)"));
+    assert!(output.contains("PROJECT KEY"));
+    assert!(output.contains("1970-01-01 00:00:00"));
+    assert!(output.find("key-one").unwrap() < output.find("key-two").unwrap());
+    assert!(output.lines().all(|line| line.len() == 129));
 }
