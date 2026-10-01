@@ -34,8 +34,7 @@ const PROTOCOL: u32 = 2;
 const HEADER_PROTOCOL: &str = "x-tuntex-protocol";
 const HEADER_REQUEST_ID: &str = "x-tuntex-request-id";
 
-#[derive(Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone)]
 struct ServerSection {
     host: IpAddr,
     port: u16,
@@ -66,33 +65,53 @@ impl Default for ServerSection {
     }
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct Engine {
     command: PathBuf,
-    #[serde(default)]
     args: Vec<String>,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 struct Config {
-    #[serde(default)]
     server: ServerSection,
     engines: BTreeMap<String, Engine>,
 }
 
 impl Config {
     fn load() -> Result<Self, String> {
-        let path = env::var_os("TUNTEX_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("tuntex-server.yaml"));
-        let raw = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let config: Self = serde_yaml::from_str(&raw)
-            .map_err(|e| format!("invalid YAML in {}: {e}", path.display()))?;
+        let config = Self::at_directory(&executable_directory()?);
         config.validate()?;
         Ok(config)
+    }
+
+    fn at_directory(directory: &Path) -> Self {
+        Self {
+            server: ServerSection {
+                projects_root: Some(directory.join("workspace")),
+                work_root: Some(directory.join(".tmp")),
+                ..ServerSection::default()
+            },
+            engines: [
+                "latexmk",
+                "xelatex",
+                "pdflatex",
+                "lualatex",
+                "bibtex",
+                "biber",
+                "makeindex",
+            ]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.into(),
+                    Engine {
+                        command: PathBuf::from(name),
+                        args: Vec::new(),
+                    },
+                )
+            })
+            .collect(),
+        }
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -259,16 +278,18 @@ fn project_command() -> Result<(), String> {
     }
 }
 
+fn executable_directory() -> Result<PathBuf, String> {
+    let executable = env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|e| format!("cannot locate executable: {e}"))?;
+    executable
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "executable has no parent directory".into())
+}
+
 fn state_dir() -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    let base = env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(not(windows))]
-    let base = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
-    let path = base
-        .ok_or_else(|| "cannot determine the per-user state directory".to_string())?
-        .join("tuntex");
+    let path = executable_directory()?.join(".state");
     fs::create_dir_all(&path)
         .map_err(|e| format!("cannot create state directory {}: {e}", path.display()))?;
     Ok(path)
@@ -1511,15 +1532,28 @@ mod tests {
     }
 
     #[test]
-    fn yaml_rejects_unknown_server_keys() {
-        let raw = "server:\n  typo: true\nengines:\n  latexmk:\n    command: latexmk\n";
-        assert!(serde_yaml::from_str::<Config>(raw).is_err());
+    fn server_defaults_need_no_configuration_file() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::at_directory(root.path());
+        config.validate().unwrap();
+        assert_eq!(
+            config.server.projects_root.as_deref(),
+            Some(root.path().join("workspace").as_path())
+        );
+        assert_eq!(config.server.port, 38117);
+        assert_eq!(config.engines.len(), 7);
     }
 
     #[test]
-    fn yaml_rejects_non_latex_engines() {
-        let raw = "engines:\n  shell:\n    command: cmd\n";
-        let config: Config = serde_yaml::from_str(raw).unwrap();
+    fn defaults_reject_non_latex_engines() {
+        let mut config = Config::at_directory(Path::new("root"));
+        config.engines.insert(
+            "shell".into(),
+            Engine {
+                command: "cmd".into(),
+                args: vec![],
+            },
+        );
         assert!(config.validate().is_err());
     }
 }
@@ -1527,8 +1561,7 @@ mod tests {
 fn incremental_jobs_keep_products_and_information_queries_keep_sources() {
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("projects");
-    let mut config: Config =
-        serde_yaml::from_str("engines:\n  xelatex:\n    command: xelatex\n").unwrap();
+    let mut config = Config::at_directory(root.path());
     config.server.projects_root = Some(registry.clone());
     let engine = config.engines.get_mut("xelatex").unwrap();
     #[cfg(windows)]

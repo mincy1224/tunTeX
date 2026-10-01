@@ -43,7 +43,7 @@ Result metadata contains `exit_code`, `timed_out`, `cancelled`, `duration_ms`, `
 
 `DELETE /jobs/{request_id}` cancels an active job. Protocol and request-ID headers must identify the same request, and the bearer key must own the job.
 
-`GET /health` reports liveness. `GET /info` reports the protocol version and configured engines.
+`GET /health` reports liveness. `GET /info` reports the protocol version and built-in engine allowlist.
 
-The server rejects path traversal, links, special files, unknown fields, unconfigured engines, dangerous environment variables, and resource-limit violations before execution.
+The server rejects path traversal, links, special files, unknown fields, engines outside its allowlist, dangerous environment variables, and resource-limit violations before execution.
 

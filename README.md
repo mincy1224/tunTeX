@@ -15,7 +15,7 @@ Binaries are in target/release. Install the client on your desktop and the serve
 
 ## Server
 
-Copy server/tuntex-server.example.yaml to tuntex-server.yaml in the server working directory. Configure the real engine commands. TUNTEX_CONFIG can select another server configuration path.
+The server has no configuration file or tunTeX environment overrides. It listens on 127.0.0.1:38117 and finds TeX engines on PATH. Make sure latexmk and your required engines are available to the account launching it.
 
 ```sh
 tuntex-server project register
@@ -28,9 +28,11 @@ tuntex-server stop
 
 Register prints a random project key. List displays a table of project IDs, readable UTC registration times, and keys in registration order. Project IDs identify server storage; project keys belong in the client's project_key field. Delete revokes the key and removes its stored workspace. List output contains credentials; keep it private.
 
-The default listener is 127.0.0.1:38117. Run without a subcommand, or use run, for foreground operation. Background logs are in ~/.local/state/tuntex/server.log on Linux and %LOCALAPPDATA%/tuntex/server.log on Windows.
+Run without a subcommand, or use run, for foreground operation. Background logs and PID state are in .state/ beside the actual server executable. System command symlinks resolve to that executable; the calling directory does not affect storage.
 
-server.projects_root selects the SQLite registry and project storage location; null uses the platform state directory's projects subdirectory. Each key owns an isolated persistent workspace. Same-project builds are serialized; different projects run concurrently up to max_concurrent_builds. Source manifests and workspace generation pointers are published together in SQLite. Request scratch directories are removed; generated products persist for subsequent latexmk, BibTeX, and Biber calls.
+Project data always lives in workspace/ beside the executable, including projects.sqlite3 and project-specific directories. Each key owns an isolated persistent workspace. Same-project builds are serialized; up to four different projects run concurrently. Built-in limits are 512 MiB per request/result, 256 MiB per uploaded file, 50,000 files, and 600 seconds per compilation. Source manifests and workspace generation pointers are published together in SQLite. Request scratch directories under .tmp/ are removed; generated products persist for subsequent latexmk, BibTeX, and Biber calls.
+
+Keep the executable and its data in one directory, such as /opt/tuntex, writable by the ordinary account running the server. Do not run it as root. When migrating an existing installation, stop the old server first and copy its entire project storage directory (including the SQLite registry) to the new workspace/ to preserve keys and data.
 
 ## Client instance
 
@@ -87,7 +89,7 @@ Queries still require a valid instance YAML and key, but no input file. Individu
 
 ## Security
 
-Project keys isolate storage, not TeX execution. Only run trusted documents under a low-privilege account. TeX/latexmk can execute programs and access host resources. Keep the listener local; remote use needs TLS, a firewall, and a trusted network. Never publish instance YAML containing keys.
+Project keys isolate storage, not TeX execution. Only run trusted documents under a low-privilege account. TeX/latexmk can execute programs and access host resources. The listener is loopback-only. Any deliberately configured external proxy needs TLS, a firewall, and a trusted network. Never publish instance YAML containing keys.
 
 Transport checks reject traversal, archive links/special files, invalid hashes, unknown engines, and oversized requests/results. Persistent storage needs disk monitoring and deletion of unused projects. Untrusted workloads require OS-level isolation.
 

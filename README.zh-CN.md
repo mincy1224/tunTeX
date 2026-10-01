@@ -15,7 +15,7 @@ cargo build --release --bin tuntex-server
 
 ## 服务端
 
-将 server/tuntex-server.example.yaml 复制为工作目录下的 tuntex-server.yaml，并配置引擎路径。TUNTEX_CONFIG 可指定其他服务端配置路径。
+服务端没有配置文件，也没有 tunTeX 环境变量覆盖。固定监听 127.0.0.1:38117，通过 PATH 查找 TeX 引擎。启动服务端的账户需能直接调用 latexmk 和所需引擎。
 
 ```sh
 tuntex-server project register
@@ -28,9 +28,11 @@ tuntex-server stop
 
 注册返回随机 key；列表用表格按注册顺序显示项目 ID、可读的 UTC 注册时间和 key。项目 ID 标识服务端存储，key 填入客户端的 project_key。删除撤销 key 并删除存储。列表包含凭据，请勿公开。
 
-默认监听 127.0.0.1:38117。无子命令或 run 为前台运行。Linux 后台日志位于 ~/.local/state/tuntex/server.log，Windows 位于 %LOCALAPPDATA%/tuntex/server.log。
+无子命令或 run 为前台运行。日志和 PID 状态位于实际服务端程序同目录的 .state/。系统命令符号链接会解析到实际程序，调用时的当前目录不会影响存储位置。
 
-server.projects_root 指定 SQLite 注册表与项目存储目录；null 使用平台状态目录下的 projects。每个 key 对应独立持久工作区，同项目串行，不同项目按 max_concurrent_builds 并发。源文件清单与工作区版本指针通过 SQLite 事务一起发布。请求临时目录自动清理，编译产物保留给后续 latexmk、BibTeX、Biber。
+项目数据固定放在程序同目录的 workspace/，包含 projects.sqlite3 和各项目目录。每个 key 对应独立持久工作区，同项目串行，最多四个不同项目并发。内置限制为请求/结果各 512 MiB、上传单文件 256 MiB、50,000 个文件、单次编译最多 600 秒。源文件清单与工作区版本指针通过 SQLite 事务一起发布。.tmp/ 下的请求临时目录自动清理，编译产物保留给后续 latexmk、BibTeX、Biber。
+
+程序和数据集中放在一个目录，例如 /opt/tuntex，由运行服务端的普通账户拥有写权限，不用 root 启动。迁移时先停止旧服务端，再将完整项目存储目录（包括 SQLite 注册表）复制到新 workspace/，保留现有 key 和文件。
 
 ## 客户端实例
 
